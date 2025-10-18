@@ -34,6 +34,7 @@ use arrow_array::{new_empty_array, ArrayRef, RecordBatch, UInt32Array, UInt64Arr
 use arrow_schema::{DataType, Field};
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
+use datafusion_proto_common::generated::datafusion_proto_common as protobuf;
 use std::{collections::HashMap, sync::Arc};
 
 use super::{AnyQuery, IndexStore, MetricsCollector, ScalarIndex, SearchResult};
@@ -504,9 +505,76 @@ impl Index for ZoneMapIndex {
     }
 
     fn statistics(&self) -> Result<serde_json::Value> {
+        // Aggregate statistics across all zones
+        let (global_min, global_max, total_null_count, total_nan_count) = if self.zones.is_empty() {
+            (None, None, 0u64, 0u64)
+        } else {
+            // Find global min across all zone mins
+            let min = self.zones.iter()
+                .map(|z| &z.min)
+                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .cloned();
+
+            // Find global max across all zone maxs
+            let max = self.zones.iter()
+                .map(|z| &z.max)
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .cloned();
+
+            // Sum null counts across all zones
+            let null_count: u64 = self.zones.iter()
+                .map(|z| z.null_count as u64)
+                .sum();
+
+            // Sum nan counts across all zones (relevant for float types)
+            let nan_count: u64 = self.zones.iter()
+                .map(|z| z.nan_count as u64)
+                .sum();
+
+            (min, max, null_count, nan_count)
+        };
+
+        // Convert to DataFusion protobuf representation for type-safe serialization
+        // The protobuf::ScalarValue type implements Serialize via pbjson, enabling
+        // proper roundtrip serialization without loss of type information
+        let min_proto: Option<protobuf::ScalarValue> = global_min
+            .as_ref()
+            .map(|v| protobuf::ScalarValue::try_from(v))
+            .transpose()
+            .map_err(|e| Error::Index {
+                message: format!("Failed to convert min value to protobuf: {}", e),
+                location: location!(),
+            })?;
+
+        let max_proto: Option<protobuf::ScalarValue> = global_max
+            .as_ref()
+            .map(|v| protobuf::ScalarValue::try_from(v))
+            .transpose()
+            .map_err(|e| Error::Index {
+                message: format!("Failed to convert max value to protobuf: {}", e),
+                location: location!(),
+            })?;
+
+        // Serialize protobuf values to JSON
+        let min_value = serde_json::to_value(&min_proto).map_err(|e| Error::Index {
+            message: format!("Failed to serialize min value: {}", e),
+            location: location!(),
+        })?;
+
+        let max_value = serde_json::to_value(&max_proto).map_err(|e| Error::Index {
+            message: format!("Failed to serialize max value: {}", e),
+            location: location!(),
+        })?;
+
         Ok(serde_json::json!({
             "num_zones": self.zones.len(),
             "rows_per_zone": self.rows_per_zone,
+            "column_stats": {
+                "min": min_value,
+                "max": max_value,
+                "null_count": total_null_count,
+                "nan_count": total_nan_count,
+            }
         }))
     }
 
