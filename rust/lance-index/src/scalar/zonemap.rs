@@ -129,6 +129,96 @@ impl DeepSizeOf for ZoneMapIndex {
 }
 
 impl ZoneMapIndex {
+    /// Returns detailed statistics for each zone in the index.
+    ///
+    /// This method provides access to per-zone min/max statistics along with fragment
+    /// mapping information, enabling per-fragment statistics aggregation for partition
+    /// pruning implementations.
+    ///
+    /// # Returns
+    ///
+    /// A JSON array containing statistics for each zone, with each entry having:
+    /// - `fragment_id`: The fragment this zone belongs to
+    /// - `zone_start`: Starting row offset within the fragment
+    /// - `zone_length`: Number of rows in this zone
+    /// - `min`: Minimum value in the zone (DataFusion protobuf format)
+    /// - `max`: Maximum value in the zone (DataFusion protobuf format)
+    /// - `null_count`: Number of null values in the zone
+    /// - `nan_count`: Number of NaN values in the zone (for float types)
+    ///
+    /// # Usage
+    ///
+    /// This method is typically accessed after downcasting from `Arc<dyn Index>`:
+    ///
+    /// ```
+    /// # use lance::Dataset;
+    /// # use lance_index::{DatasetIndexExt, IndexType};
+    /// # async fn example(dataset: &Dataset, column: &str, index_name: &str) -> lance_core::Result<()> {
+    /// let index = dataset
+    ///     .open_scalar_index_by_name(column, index_name)
+    ///     .await?
+    ///     .expect("Index not found");
+    ///
+    /// if index.index_type() == IndexType::ZoneMap {
+    ///     if let Some(zonemap) = index.as_any().downcast_ref::<lance_index::scalar::zonemap::ZoneMapIndex>() {
+    ///         let zone_stats = zonemap.zone_statistics()?;
+    ///         // Process per-zone statistics for fragment-level aggregation
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn zone_statistics(&self) -> Result<serde_json::Value> {
+        use datafusion_proto_common::generated::datafusion_proto_common as protobuf;
+
+        if self.zones.is_empty() {
+            return Ok(serde_json::json!([]));
+        }
+
+        let zones_json: Result<Vec<serde_json::Value>> = self.zones
+            .iter()
+            .map(|zone| {
+                // Convert min/max to DataFusion protobuf for type-safe serialization
+                let min_proto = protobuf::ScalarValue::try_from(&zone.min)
+                    .map_err(|e| Error::Index {
+                        message: format!("Failed to convert zone min value to protobuf: {}", e),
+                        location: location!(),
+                    })?;
+
+                let max_proto = protobuf::ScalarValue::try_from(&zone.max)
+                    .map_err(|e| Error::Index {
+                        message: format!("Failed to convert zone max value to protobuf: {}", e),
+                        location: location!(),
+                    })?;
+
+                // Serialize protobuf values to JSON
+                let min_value = serde_json::to_value(&min_proto)
+                    .map_err(|e| Error::Index {
+                        message: format!("Failed to serialize zone min value: {}", e),
+                        location: location!(),
+                    })?;
+
+                let max_value = serde_json::to_value(&max_proto)
+                    .map_err(|e| Error::Index {
+                        message: format!("Failed to serialize zone max value: {}", e),
+                        location: location!(),
+                    })?;
+
+                Ok(serde_json::json!({
+                    "fragment_id": zone.fragment_id,
+                    "zone_start": zone.zone_start,
+                    "zone_length": zone.zone_length,
+                    "min": min_value,
+                    "max": max_value,
+                    "null_count": zone.null_count,
+                    "nan_count": zone.nan_count,
+                }))
+            })
+            .collect();
+
+        Ok(serde_json::Value::Array(zones_json?))
+    }
+
     /// Evaluates whether a zone could potentially contain values matching the query
     /// For NaN, total order is used here
     /// reference: https://doc.rust-lang.org/std/primitive.f64.html#method.total_cmp
