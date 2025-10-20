@@ -979,7 +979,13 @@ impl BTreeIndex {
         // The BTreeMap is sorted by MIN value, and pages with the same MIN
         // are in file order, which equals creation order from the sorted input stream
         let mut sorted_pages = Vec::new();
-        for (_min_value, page_records) in self.page_lookup.tree.iter() {
+
+        // Debug: Log first 5 keys from BTreeMap
+        log::debug!("BTreeMap has {} entries", self.page_lookup.tree.len());
+        for (i, (min_value, page_records)) in self.page_lookup.tree.iter().enumerate() {
+            if i < 5 {
+                log::debug!("  Entry {}: min_value={:?}, {} pages", i, min_value, page_records.len());
+            }
             for page_record in page_records {
                 sorted_pages.push(page_record.page_number);
             }
