@@ -7,7 +7,10 @@ use std::{
     collections::{BTreeMap, BinaryHeap, HashMap},
     fmt::{Debug, Display},
     ops::Bound,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        Arc,
+    },
 };
 
 use super::{
@@ -949,14 +952,34 @@ impl BTreeIndex {
     /// Create a stream of all the data in the index, in the same format used to train the index
     ///
     /// Returns a stream of (value, row_id) pairs in sorted order by value.
+    ///
+    /// If `limit` is specified, the stream will stop after returning that many rows, avoiding
+    /// unnecessary I/O for the remaining index pages.
     pub async fn into_data_stream(self) -> Result<SendableRecordBatchStream> {
+        self.into_data_stream_limited(None).await
+    }
+
+    /// Create a limited stream of data from the index
+    ///
+    /// Returns a stream of (value, row_id) pairs in sorted order by value.
+    /// The stream will stop after returning `limit` rows, providing efficient
+    /// ordered scans for queries with LIMIT clauses.
+    pub async fn into_data_stream_limited(
+        self,
+        limit: Option<usize>,
+    ) -> Result<SendableRecordBatchStream> {
         let reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
         let schema = self.sub_index.schema().clone();
         let value_field = schema.field(0).clone().with_name(VALUE_COLUMN_NAME);
         let row_id_field = schema.field(1).clone().with_name(ROW_ID);
         let new_schema = Arc::new(Schema::new(vec![value_field, row_id_field]));
         let new_schema_clone = new_schema.clone();
-        let reader_stream = IndexReaderStream::new(reader, self.batch_size).await;
+
+        let mut reader_stream = IndexReaderStream::new(reader, self.batch_size).await;
+        if let Some(limit) = limit {
+            reader_stream = reader_stream.with_limit(limit);
+        }
+
         let batches = reader_stream
             .map(|fut| fut.map_err(DataFusionError::from))
             .buffered(self.store.io_parallelism())
@@ -1847,6 +1870,8 @@ struct IndexReaderStream {
     batch_size: u64,
     num_batches: u32,
     batch_idx: u32,
+    limit_rows: Option<usize>,
+    rows_yielded: Arc<AtomicUsize>,
 }
 
 impl IndexReaderStream {
@@ -1857,7 +1882,14 @@ impl IndexReaderStream {
             batch_size,
             num_batches,
             batch_idx: 0,
+            limit_rows: None,
+            rows_yielded: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    fn with_limit(mut self, limit: usize) -> Self {
+        self.limit_rows = Some(limit);
+        self
     }
 }
 
@@ -1869,6 +1901,14 @@ impl Stream for IndexReaderStream {
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         let this = self.get_mut();
+
+        // Check row limit before creating new read future
+        if let Some(limit) = this.limit_rows {
+            if this.rows_yielded.load(AtomicOrdering::Relaxed) >= limit {
+                return std::task::Poll::Ready(None);
+            }
+        }
+
         if this.batch_idx >= this.num_batches {
             return std::task::Poll::Ready(None);
         }
@@ -1876,10 +1916,27 @@ impl Stream for IndexReaderStream {
         this.batch_idx += 1;
         let reader_copy = this.reader.clone();
         let batch_size = this.batch_size;
+        let limit_rows = this.limit_rows;
+        let rows_yielded = this.rows_yielded.clone();
+
         let read_task = async move {
-            reader_copy
+            let batch = reader_copy
                 .read_record_batch(batch_num as u64, batch_size)
-                .await
+                .await?;
+
+            let batch_rows = batch.num_rows();
+            let current_rows = rows_yielded.fetch_add(batch_rows, AtomicOrdering::Relaxed);
+
+            // Truncate final batch if it exceeds limit
+            if let Some(limit) = limit_rows {
+                let total_rows = current_rows + batch_rows;
+                if total_rows > limit {
+                    let take = limit.saturating_sub(current_rows);
+                    return Ok(batch.slice(0, take));
+                }
+            }
+
+            Ok(batch)
         }
         .boxed();
         std::task::Poll::Ready(Some(read_task))
