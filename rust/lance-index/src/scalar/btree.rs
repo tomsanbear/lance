@@ -979,13 +979,7 @@ impl BTreeIndex {
         // The BTreeMap is sorted by MIN value, and pages with the same MIN
         // are in file order, which equals creation order from the sorted input stream
         let mut sorted_pages = Vec::new();
-
-        // Debug: Log first 5 keys from BTreeMap
-        log::debug!("BTreeMap has {} entries", self.page_lookup.tree.len());
-        for (i, (min_value, page_records)) in self.page_lookup.tree.iter().enumerate() {
-            if i < 5 {
-                log::debug!("  Entry {}: min_value={:?}, {} pages", i, min_value, page_records.len());
-            }
+        for (_min_value, page_records) in self.page_lookup.tree.iter() {
             for page_record in page_records {
                 sorted_pages.push(page_record.page_number);
             }
@@ -996,7 +990,7 @@ impl BTreeIndex {
         let batch_size = self.batch_size;
         let rows_yielded = Arc::new(AtomicUsize::new(0));
 
-        let page_stream = stream::iter(sorted_pages.into_iter().enumerate().map(move |(position, page_num)| {
+        let page_stream = stream::iter(sorted_pages.into_iter().map(move |page_num| {
             let reader = reader.clone();
             let rows_yielded = rows_yielded.clone();
             let limit = limit;
@@ -1011,18 +1005,6 @@ impl BTreeIndex {
 
                 let batch = reader.read_record_batch(page_num as u64, batch_size).await?;
                 let batch_rows = batch.num_rows();
-
-                // Debug: Log page reads (limit to first 10 pages BY POSITION, not page number!)
-                if position < 10 {
-                    if batch_rows > 0 {
-                        use arrow::array::AsArray;
-                        let first_value = batch.column(0).as_string::<i32>().value(0);
-                        log::debug!("  Position {}, Page {}: {} rows, first=\"{}\"", position, page_num, batch_rows, first_value);
-                    } else {
-                        log::debug!("  Position {}, Page {}: EMPTY (0 rows)", position, page_num);
-                    }
-                }
-
                 let current_rows = rows_yielded.fetch_add(batch_rows, AtomicOrdering::Relaxed);
 
                 // Truncate final batch if it exceeds limit
