@@ -975,14 +975,56 @@ impl BTreeIndex {
         let new_schema = Arc::new(Schema::new(vec![value_field, row_id_field]));
         let new_schema_clone = new_schema.clone();
 
-        let mut reader_stream = IndexReaderStream::new(reader, self.batch_size).await;
-        if let Some(limit) = limit {
-            reader_stream = reader_stream.with_limit(limit);
+        // Collect page numbers in sorted order by iterating the BTreeMap
+        // The BTreeMap is sorted by MIN value, and pages with the same MIN
+        // are in file order, which equals creation order from the sorted input stream
+        let mut sorted_pages = Vec::new();
+        for (_min_value, page_records) in self.page_lookup.tree.iter() {
+            for page_record in page_records {
+                sorted_pages.push(page_record.page_number);
+            }
         }
 
-        let batches = reader_stream
-            .map(|fut| fut.map_err(DataFusionError::from))
+        // Create a stream that reads pages in sorted order with early termination
+        let reader = Arc::new(reader);
+        let batch_size = self.batch_size;
+        let rows_yielded = Arc::new(AtomicUsize::new(0));
+
+        let page_stream = stream::iter(sorted_pages.into_iter().map(move |page_num| {
+            let reader = reader.clone();
+            let rows_yielded = rows_yielded.clone();
+            let limit = limit;
+
+            async move {
+                // Check if we've already hit the limit before reading
+                if let Some(lim) = limit {
+                    if rows_yielded.load(AtomicOrdering::Relaxed) >= lim {
+                        return Ok(None);
+                    }
+                }
+
+                let batch = reader.read_record_batch(page_num as u64, batch_size).await?;
+                let batch_rows = batch.num_rows();
+                let current_rows = rows_yielded.fetch_add(batch_rows, AtomicOrdering::Relaxed);
+
+                // Truncate final batch if it exceeds limit
+                if let Some(lim) = limit {
+                    let total_rows = current_rows + batch_rows;
+                    if total_rows > lim {
+                        let take = lim.saturating_sub(current_rows);
+                        return Ok(Some(batch.slice(0, take)));
+                    }
+                }
+
+                Ok(Some(batch))
+            }
+        }));
+
+        let batches = page_stream
             .buffered(self.store.io_parallelism())
+            .try_take_while(|opt_batch| futures::future::ready(Ok(opt_batch.is_some())))
+            .map_ok(|opt_batch| opt_batch.unwrap())
+            .map_err(DataFusionError::from)
             .map_ok(move |batch| {
                 RecordBatch::try_new(
                     new_schema.clone(),
@@ -991,6 +1033,7 @@ impl BTreeIndex {
                 .unwrap()
             })
             .boxed();
+
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             new_schema_clone,
             batches,
