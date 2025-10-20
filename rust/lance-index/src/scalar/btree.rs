@@ -1015,8 +1015,9 @@ impl BTreeIndex {
                 // Debug: Log page reads (limit to first 10 pages)
                 if page_num < 10 {
                     if batch_rows > 0 {
-                        let first_value = batch.column(0).slice(0, 1);
-                        log::debug!("  Page {}: {} rows, first_value={:?}", page_num, batch_rows, first_value);
+                        use arrow::array::AsArray;
+                        let first_value = batch.column(0).as_string::<i32>().value(0);
+                        log::debug!("  Page {}: {} rows, first=\"{}\"", page_num, batch_rows, first_value);
                     } else {
                         log::debug!("  Page {}: EMPTY (0 rows)", page_num);
                     }
