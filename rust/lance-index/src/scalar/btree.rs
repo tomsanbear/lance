@@ -1039,7 +1039,7 @@ impl BTreeIndex {
         }));
 
         let batches = page_stream
-            .buffered(self.store.io_parallelism())
+            .buffered(1)  // Sequential processing to guarantee order with early termination
             .try_take_while(|opt_batch| futures::future::ready(Ok::<bool, lance_core::Error>(opt_batch.is_some())))
             .map_ok(|opt_batch| opt_batch.unwrap())
             .map_err(DataFusionError::from)
