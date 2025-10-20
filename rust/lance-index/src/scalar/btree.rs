@@ -996,7 +996,7 @@ impl BTreeIndex {
         let batch_size = self.batch_size;
         let rows_yielded = Arc::new(AtomicUsize::new(0));
 
-        let page_stream = stream::iter(sorted_pages.into_iter().map(move |page_num| {
+        let page_stream = stream::iter(sorted_pages.into_iter().enumerate().map(move |(position, page_num)| {
             let reader = reader.clone();
             let rows_yielded = rows_yielded.clone();
             let limit = limit;
@@ -1012,14 +1012,14 @@ impl BTreeIndex {
                 let batch = reader.read_record_batch(page_num as u64, batch_size).await?;
                 let batch_rows = batch.num_rows();
 
-                // Debug: Log page reads (limit to first 10 pages)
-                if page_num < 10 {
+                // Debug: Log page reads (limit to first 10 pages BY POSITION, not page number!)
+                if position < 10 {
                     if batch_rows > 0 {
                         use arrow::array::AsArray;
                         let first_value = batch.column(0).as_string::<i32>().value(0);
-                        log::debug!("  Page {}: {} rows, first=\"{}\"", page_num, batch_rows, first_value);
+                        log::debug!("  Position {}, Page {}: {} rows, first=\"{}\"", position, page_num, batch_rows, first_value);
                     } else {
-                        log::debug!("  Page {}: EMPTY (0 rows)", page_num);
+                        log::debug!("  Position {}, Page {}: EMPTY (0 rows)", position, page_num);
                     }
                 }
 
