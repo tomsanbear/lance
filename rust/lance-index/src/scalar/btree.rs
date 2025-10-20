@@ -947,7 +947,9 @@ impl BTreeIndex {
     }
 
     /// Create a stream of all the data in the index, in the same format used to train the index
-    async fn into_data_stream(self) -> Result<SendableRecordBatchStream> {
+    ///
+    /// Returns a stream of (value, row_id) pairs in sorted order by value.
+    pub async fn into_data_stream(self) -> Result<SendableRecordBatchStream> {
         let reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
         let schema = self.sub_index.schema().clone();
         let value_field = schema.field(0).clone().with_name(VALUE_COLUMN_NAME);
