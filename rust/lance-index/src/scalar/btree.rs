@@ -1011,6 +1011,17 @@ impl BTreeIndex {
 
                 let batch = reader.read_record_batch(page_num as u64, batch_size).await?;
                 let batch_rows = batch.num_rows();
+
+                // Debug: Log page reads (limit to first 10 pages)
+                if page_num < 10 {
+                    if batch_rows > 0 {
+                        let first_value = batch.column(0).slice(0, 1);
+                        log::debug!("  Page {}: {} rows, first_value={:?}", page_num, batch_rows, first_value);
+                    } else {
+                        log::debug!("  Page {}: EMPTY (0 rows)", page_num);
+                    }
+                }
+
                 let current_rows = rows_yielded.fetch_add(batch_rows, AtomicOrdering::Relaxed);
 
                 // Truncate final batch if it exceeds limit
