@@ -7,10 +7,7 @@ use std::{
     collections::{BTreeMap, BinaryHeap, HashMap},
     fmt::{Debug, Display},
     ops::Bound,
-    sync::{
-        atomic::{AtomicUsize, Ordering as AtomicOrdering},
-        Arc,
-    },
+    sync::Arc,
 };
 
 use super::{
@@ -951,23 +948,83 @@ impl BTreeIndex {
 
     /// Create a stream of all the data in the index, in the same format used to train the index
     ///
-    /// Returns a stream of (value, row_id) pairs in sorted order by value.
+    /// Returns a stream of (value, row_id) pairs. **Order is not guaranteed** - pages are
+    /// read in file order with parallel I/O for maximum throughput.
     ///
-    /// If `limit` is specified, the stream will stop after returning that many rows, avoiding
-    /// unnecessary I/O for the remaining index pages.
-    pub async fn into_data_stream(self) -> Result<SendableRecordBatchStream> {
-        self.into_data_stream_limited(None).await
+    /// This method is optimized for bulk operations like index verification, rebuilding,
+    /// or statistics collection where order doesn't matter and throughput is critical.
+    ///
+    /// For queries that require sorted results (e.g., ORDER BY), use [`Self::into_sorted_data_stream`] instead.
+    async fn into_data_stream(self) -> Result<SendableRecordBatchStream> {
+        let reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
+        let schema = self.sub_index.schema().clone();
+        let value_field = schema.field(0).clone().with_name(VALUE_COLUMN_NAME);
+        let row_id_field = schema.field(1).clone().with_name(ROW_ID);
+        let new_schema = Arc::new(Schema::new(vec![value_field, row_id_field]));
+        let new_schema_clone = new_schema.clone();
+        let reader_stream = IndexReaderStream::new(reader, self.batch_size).await;
+        let batches = reader_stream
+            .map(|fut| fut.map_err(DataFusionError::from))
+            .buffered(self.store.io_parallelism())
+            .map_ok(move |batch| {
+                RecordBatch::try_new(
+                    new_schema.clone(),
+                    vec![batch.column(0).clone(), batch.column(1).clone()],
+                )
+                .unwrap()
+            })
+            .boxed();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            new_schema_clone,
+            batches,
+        )))
     }
 
-    /// Create a limited stream of data from the index
+    /// Create a stream of data from the index in sorted order
     ///
-    /// Returns a stream of (value, row_id) pairs in sorted order by value.
-    /// The stream will stop after returning `limit` rows, providing efficient
-    /// ordered scans for queries with LIMIT clauses.
-    pub async fn into_data_stream_limited(
-        self,
-        limit: Option<usize>,
-    ) -> Result<SendableRecordBatchStream> {
+    /// Returns a stream of (value, row_id) pairs **in sorted order by value**.
+    /// Pages are read sequentially in sorted order, making this suitable for:
+    /// - ORDER BY queries with early termination (consumer can break when done)
+    /// - Range scans that require sorted results
+    /// - Top-K queries (ORDER BY ... LIMIT N)
+    ///
+    /// # Backpressure Handling
+    ///
+    /// This method uses sequential I/O to preserve order and respond to backpressure.
+    /// If the consumer stops reading (e.g., after collecting enough rows for a LIMIT clause),
+    /// the stream will automatically stop reading subsequent pages, avoiding unnecessary I/O.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use lance_index::scalar::btree::BTreeIndex;
+    /// # use futures::stream::StreamExt;
+    /// # async fn example(btree: BTreeIndex) -> lance_core::Result<()> {
+    /// use futures::pin_mut;
+    /// use futures::stream::TryStreamExt;
+    ///
+    /// // Get sorted stream
+    /// let stream = btree.into_sorted_data_stream().await?;
+    /// pin_mut!(stream);
+    ///
+    /// // Consume only what we need (e.g., LIMIT 100)
+    /// let mut count = 0;
+    /// while let Some(batch) = stream.try_next().await? {
+    ///     // Process batch...
+    ///     count += batch.num_rows();
+    ///     if count >= 100 {
+    ///         break;  // Stream drop prevents reading more pages
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Performance
+    ///
+    /// For bulk operations where order doesn't matter, use [`Self::into_data_stream`] instead,
+    /// which uses parallel I/O for higher throughput.
+    pub async fn into_sorted_data_stream(self) -> Result<SendableRecordBatchStream> {
         let reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
         let schema = self.sub_index.schema().clone();
         let value_field = schema.field(0).clone().with_name(VALUE_COLUMN_NAME);
@@ -985,45 +1042,19 @@ impl BTreeIndex {
             }
         }
 
-        // Create a stream that reads pages in sorted order with early termination
+        // Create a stream that reads pages in sorted order
         let reader = Arc::new(reader);
         let batch_size = self.batch_size;
-        let rows_yielded = Arc::new(AtomicUsize::new(0));
 
         let page_stream = stream::iter(sorted_pages.into_iter().map(move |page_num| {
             let reader = reader.clone();
-            let rows_yielded = rows_yielded.clone();
-            let limit = limit;
-
             async move {
-                // Check if we've already hit the limit before reading
-                if let Some(lim) = limit {
-                    if rows_yielded.load(AtomicOrdering::Relaxed) >= lim {
-                        return Ok(None);
-                    }
-                }
-
-                let batch = reader.read_record_batch(page_num as u64, batch_size).await?;
-                let batch_rows = batch.num_rows();
-                let current_rows = rows_yielded.fetch_add(batch_rows, AtomicOrdering::Relaxed);
-
-                // Truncate final batch if it exceeds limit
-                if let Some(lim) = limit {
-                    let total_rows = current_rows + batch_rows;
-                    if total_rows > lim {
-                        let take = lim.saturating_sub(current_rows);
-                        return Ok(Some(batch.slice(0, take)));
-                    }
-                }
-
-                Ok(Some(batch))
+                reader.read_record_batch(page_num as u64, batch_size).await
             }
         }));
 
         let batches = page_stream
-            .buffered(1)  // Sequential processing to guarantee order with early termination
-            .try_take_while(|opt_batch| futures::future::ready(Ok::<bool, lance_core::Error>(opt_batch.is_some())))
-            .map_ok(|opt_batch| opt_batch.unwrap())
+            .buffered(1)  // Sequential processing to preserve order and respond to backpressure
             .map_err(DataFusionError::from)
             .map_ok(move |batch| {
                 RecordBatch::try_new(
@@ -1913,8 +1944,6 @@ struct IndexReaderStream {
     batch_size: u64,
     num_batches: u32,
     batch_idx: u32,
-    limit_rows: Option<usize>,
-    rows_yielded: Arc<AtomicUsize>,
 }
 
 impl IndexReaderStream {
@@ -1925,14 +1954,7 @@ impl IndexReaderStream {
             batch_size,
             num_batches,
             batch_idx: 0,
-            limit_rows: None,
-            rows_yielded: Arc::new(AtomicUsize::new(0)),
         }
-    }
-
-    fn with_limit(mut self, limit: usize) -> Self {
-        self.limit_rows = Some(limit);
-        self
     }
 }
 
@@ -1945,13 +1967,6 @@ impl Stream for IndexReaderStream {
     ) -> std::task::Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
-        // Check row limit before creating new read future
-        if let Some(limit) = this.limit_rows {
-            if this.rows_yielded.load(AtomicOrdering::Relaxed) >= limit {
-                return std::task::Poll::Ready(None);
-            }
-        }
-
         if this.batch_idx >= this.num_batches {
             return std::task::Poll::Ready(None);
         }
@@ -1959,27 +1974,11 @@ impl Stream for IndexReaderStream {
         this.batch_idx += 1;
         let reader_copy = this.reader.clone();
         let batch_size = this.batch_size;
-        let limit_rows = this.limit_rows;
-        let rows_yielded = this.rows_yielded.clone();
 
         let read_task = async move {
-            let batch = reader_copy
+            reader_copy
                 .read_record_batch(batch_num as u64, batch_size)
-                .await?;
-
-            let batch_rows = batch.num_rows();
-            let current_rows = rows_yielded.fetch_add(batch_rows, AtomicOrdering::Relaxed);
-
-            // Truncate final batch if it exceeds limit
-            if let Some(limit) = limit_rows {
-                let total_rows = current_rows + batch_rows;
-                if total_rows > limit {
-                    let take = limit.saturating_sub(current_rows);
-                    return Ok(batch.slice(0, take));
-                }
-            }
-
-            Ok(batch)
+                .await
         }
         .boxed();
         std::task::Poll::Ready(Some(read_task))
