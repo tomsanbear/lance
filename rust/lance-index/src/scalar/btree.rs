@@ -27,6 +27,7 @@ use crate::{metrics::NoOpMetricsCollector, scalar::registry::TrainingCriteria};
 use crate::{Index, IndexType};
 use arrow_array::{new_empty_array, Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
+use arrow_select::take;
 use async_trait::async_trait;
 use datafusion::physical_plan::{
     sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
@@ -1148,9 +1149,40 @@ impl BTreeIndex {
             .buffered(1)  // Sequential processing to preserve order and respond to backpressure
             .map_err(DataFusionError::from)
             .map_ok(move |batch| {
+                // Reverse the rows within this batch for true DESC ordering
+                // Each batch is internally sorted ASC, so we need to reverse it
+                let num_rows = batch.num_rows();
+                if num_rows == 0 {
+                    return RecordBatch::try_new(
+                        new_schema.clone(),
+                        vec![batch.column(0).clone(), batch.column(1).clone()],
+                    )
+                    .unwrap();
+                }
+
+                // Create reversed indices: [n-1, n-2, ..., 1, 0]
+                let reversed_indices: UInt32Array = (0..num_rows)
+                    .rev()
+                    .map(|i| i as u32)
+                    .collect();
+
+                // Take rows in reversed order
+                let reversed_col0 = take::take(
+                    batch.column(0).as_ref(),
+                    &reversed_indices,
+                    None,
+                )
+                .unwrap();
+                let reversed_col1 = take::take(
+                    batch.column(1).as_ref(),
+                    &reversed_indices,
+                    None,
+                )
+                .unwrap();
+
                 RecordBatch::try_new(
                     new_schema.clone(),
-                    vec![batch.column(0).clone(), batch.column(1).clone()],
+                    vec![reversed_col0, reversed_col1],
                 )
                 .unwrap()
             })
