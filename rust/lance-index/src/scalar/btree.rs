@@ -1071,6 +1071,97 @@ impl BTreeIndex {
         )))
     }
 
+    /// Create a stream of data from the index in reverse sorted order (descending)
+    ///
+    /// Returns a stream of (value, row_id) pairs **in reverse sorted order by value** (largest to smallest).
+    /// Pages are read sequentially in reverse sorted order, making this suitable for:
+    /// - ORDER BY ... DESC queries with early termination
+    /// - Reverse range scans
+    /// - Top-K queries with descending sort (ORDER BY ... DESC LIMIT N)
+    ///
+    /// # Backpressure Handling
+    ///
+    /// This method uses sequential I/O to preserve order and respond to backpressure.
+    /// If the consumer stops reading (e.g., after collecting enough rows for a LIMIT clause),
+    /// the stream will automatically stop reading subsequent pages, avoiding unnecessary I/O.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use lance_index::scalar::btree::BTreeIndex;
+    /// # use futures::stream::StreamExt;
+    /// # async fn example(btree: BTreeIndex) -> lance_core::Result<()> {
+    /// use futures::pin_mut;
+    /// use futures::stream::TryStreamExt;
+    ///
+    /// // Get reverse sorted stream (largest values first)
+    /// let stream = btree.into_reverse_sorted_data_stream().await?;
+    /// pin_mut!(stream);
+    ///
+    /// // Consume only what we need (e.g., ORDER BY col DESC LIMIT 100)
+    /// let mut count = 0;
+    /// while let Some(batch) = stream.try_next().await? {
+    ///     // Process batch...
+    ///     count += batch.num_rows();
+    ///     if count >= 100 {
+    ///         break;  // Stream drop prevents reading more pages
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Performance
+    ///
+    /// Uses the same sequential I/O pattern as [`Self::into_sorted_data_stream`], but traverses
+    /// the BTreeMap in reverse order to produce descending results.
+    pub async fn into_reverse_sorted_data_stream(self) -> Result<SendableRecordBatchStream> {
+        let reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
+        let schema = self.sub_index.schema().clone();
+        let value_field = schema.field(0).clone().with_name(VALUE_COLUMN_NAME);
+        let row_id_field = schema.field(1).clone().with_name(ROW_ID);
+        let new_schema = Arc::new(Schema::new(vec![value_field, row_id_field]));
+        let new_schema_clone = new_schema.clone();
+
+        // Collect page numbers in reverse sorted order by iterating the BTreeMap backwards
+        // The BTreeMap is sorted by MIN value, so .rev() gives us largest MIN values first
+        let mut sorted_pages = Vec::new();
+        for (_min_value, page_records) in self.page_lookup.tree.iter().rev() {
+            // Within each MIN value group, reverse the pages as well
+            for page_record in page_records.iter().rev() {
+                sorted_pages.push(page_record.page_number);
+            }
+        }
+
+        // Create a stream that reads pages in reverse sorted order
+        let reader = Arc::new(reader);
+        let batch_size = self.batch_size;
+
+        let page_stream = stream::iter(sorted_pages.into_iter().map(move |page_num| {
+            let reader = reader.clone();
+            async move {
+                reader.read_record_batch(page_num as u64, batch_size).await
+            }
+        }));
+
+        let batches = page_stream
+            .buffered(1)  // Sequential processing to preserve order and respond to backpressure
+            .map_err(DataFusionError::from)
+            .map_ok(move |batch| {
+                RecordBatch::try_new(
+                    new_schema.clone(),
+                    vec![batch.column(0).clone(), batch.column(1).clone()],
+                )
+                .unwrap()
+            })
+            .boxed();
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            new_schema_clone,
+            batches,
+        )))
+    }
+
     async fn into_old_data(self) -> Result<Arc<dyn ExecutionPlan>> {
         let stream = self.into_data_stream().await?;
         Ok(Arc::new(OneShotExec::new(stream)))
