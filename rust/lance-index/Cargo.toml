@@ -22,6 +22,7 @@ async-recursion.workspace = true
 async-trait.workspace = true
 bitvec.workspace = true
 datafusion-common.workspace = true
+datafusion-proto-common.workspace = true
 datafusion-expr.workspace = true
 datafusion-physical-expr.workspace = true
 datafusion-sql.workspace = true
