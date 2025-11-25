@@ -1061,6 +1061,36 @@ impl DatasetIndexExt for Dataset {
             ))),
         }
     }
+
+    async fn open_scalar_index_by_name(
+        &self,
+        column: &str,
+        index_name: &str,
+    ) -> Result<Option<Arc<dyn Index>>> {
+        use lance_index::{metrics::NoOpMetricsCollector, ScalarIndexCriteria};
+
+        // Find index metadata by name
+        let idx_metadata = self
+            .load_scalar_index(ScalarIndexCriteria::default().with_name(index_name))
+            .await?;
+
+        match idx_metadata {
+            Some(metadata) => {
+                // Open the actual index instance using internal method
+                let index = self
+                    .open_scalar_index(
+                        column,
+                        &metadata.uuid.to_string(),
+                        &NoOpMetricsCollector,
+                    )
+                    .await?;
+
+                // Return as generic Index trait object
+                Ok(Some(index.as_index()))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 pub(crate) fn retain_supported_indices(indices: &mut Vec<IndexMetadata>) {
