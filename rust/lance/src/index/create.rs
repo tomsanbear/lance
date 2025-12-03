@@ -98,19 +98,40 @@ impl<'a> CreateIndexBuilder<'a> {
 
     #[instrument(skip_all)]
     pub async fn execute_uncommitted(&mut self) -> Result<IndexMetadata> {
-        if self.columns.len() != 1 {
+        // Validate column count
+        if self.columns.is_empty() {
             return Err(Error::Index {
-                message: "Only support building index on 1 column at the moment".to_string(),
+                message: "Index must have at least one column".to_string(),
                 location: location!(),
             });
         }
-        let column = &self.columns[0];
-        let Some(field) = self.dataset.schema().field(column) else {
+        if self.columns.len() > 8 {
             return Err(Error::Index {
-                message: format!("CreateIndex: column '{column}' does not exist"),
+                message: format!(
+                    "Compound index exceeds maximum of 8 columns (got {})",
+                    self.columns.len()
+                ),
                 location: location!(),
             });
-        };
+        }
+
+        // Validate all columns exist and collect their fields
+        let mut fields: Vec<lance_core::datatypes::Field> = Vec::with_capacity(self.columns.len());
+        for column in &self.columns {
+            let Some(field) = self.dataset.schema().field(column) else {
+                return Err(Error::Index {
+                    message: format!("CreateIndex: column '{}' does not exist", column),
+                    location: location!(),
+                });
+            };
+            fields.push(field.clone());
+        }
+
+        // For single-column indices, use the original column variable pattern
+        // For multi-column indices, we'll use the first column for backward-compatible paths
+        let column = &self.columns[0];
+        #[allow(unused_variables)]
+        let field = &fields[0];
 
         // If train is true but dataset is empty, automatically set train to false
         let train = if self.train {
@@ -125,21 +146,32 @@ impl<'a> CreateIndexBuilder<'a> {
             .dataset
             .open_frag_reuse_index(&NoOpMetricsCollector)
             .await?;
-        let index_name = self.name.take().unwrap_or(format!("{column}_idx"));
+        // Generate index name: single column uses "column_idx", multiple use "col1_col2_idx"
+        let index_name = self.name.take().unwrap_or_else(|| {
+            if self.columns.len() == 1 {
+                format!("{column}_idx")
+            } else {
+                format!("{}_idx", self.columns.join("_"))
+            }
+        });
+
+        // Collect field IDs for comparison and storage
+        let field_ids: Vec<i32> = fields.iter().map(|f| f.id).collect();
+
         if let Some(idx) = indices.iter().find(|i| i.name == index_name) {
-            if idx.fields == [field.id] && !self.replace {
+            if idx.fields == field_ids && !self.replace {
                 return Err(Error::Index {
                     message: format!(
-                        "Index name '{index_name} already exists, \
+                        "Index name '{index_name}' already exists, \
                         please specify a different name or use replace=True"
                     ),
                     location: location!(),
                 });
             };
-            if idx.fields != [field.id] {
+            if idx.fields != field_ids {
                 return Err(Error::Index {
                     message: format!(
-                        "Index name '{index_name} already exists with different fields, \
+                        "Index name '{index_name}' already exists with different fields, \
                         please specify a different name"
                     ),
                     location: location!(),
@@ -353,7 +385,7 @@ impl<'a> CreateIndexBuilder<'a> {
         Ok(IndexMetadata {
             uuid: index_id,
             name: index_name,
-            fields: vec![field.id],
+            fields: field_ids,
             dataset_version: self.dataset.manifest.version,
             fragment_bitmap: if train {
                 match &self.fragments {
