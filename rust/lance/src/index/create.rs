@@ -7,7 +7,7 @@ use crate::{
         Dataset,
     },
     index::{
-        scalar::build_scalar_index,
+        scalar::{build_compound_btree_index, build_scalar_index},
         vector::{
             build_empty_vector_index, build_vector_index, VectorIndexParams, LANCE_VECTOR_INDEX,
         },
@@ -186,7 +186,44 @@ impl<'a> CreateIndexBuilder<'a> {
             })?,
             None => Uuid::new_v4(),
         };
-        let created_index = match (self.index_type, self.params.index_name()) {
+
+        // Handle multi-column (compound) indices
+        let created_index = if self.columns.len() > 1 {
+            match (self.index_type, self.params.index_name()) {
+                // BTree/Scalar index types support compound indices
+                (IndexType::Scalar | IndexType::BTree, LANCE_SCALAR_INDEX) => {
+                    // Get params or use defaults for compound index
+                    let params = self
+                        .params
+                        .as_any()
+                        .downcast_ref::<ScalarIndexParams>()
+                        .cloned()
+                        .unwrap_or_else(|| ScalarIndexParams::new("compoundbtree".to_string()));
+
+                    build_compound_btree_index(
+                        self.dataset,
+                        &self.columns.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                        &index_id.to_string(),
+                        &params,
+                        train,
+                        self.fragments.clone(),
+                    )
+                    .await?
+                }
+                (index_type, _) => {
+                    return Err(Error::Index {
+                        message: format!(
+                            "Index type {:?} does not support multiple columns. \
+                             Use BTree or Scalar for compound indices.",
+                            index_type
+                        ),
+                        location: location!(),
+                    });
+                }
+            }
+        } else {
+            // Single-column index path (existing logic)
+            match (self.index_type, self.params.index_name()) {
             (
                 IndexType::Bitmap
                 | IndexType::BTree
@@ -380,7 +417,8 @@ impl<'a> CreateIndexBuilder<'a> {
                     location: location!(),
                 });
             }
-        };
+        }
+        }; // Close the if-else for multi-column check
 
         Ok(IndexMetadata {
             uuid: index_id,
@@ -789,5 +827,137 @@ mod tests {
             .iter()
             .any(|idx| idx.fragment_bitmap.as_ref().unwrap().contains(1)
                 && idx.fragment_bitmap.as_ref().unwrap().len() == 1));
+    }
+
+    #[tokio::test]
+    async fn test_create_compound_index() {
+        use lance_index::scalar::ScalarIndexParams;
+        use lance_index::DatasetIndexExt;
+
+        // Create temporary directory for dataset
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        // Create test data with multiple columns suitable for compound index
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("tenant_id", DataType::Utf8, false),
+            ArrowField::new("status", DataType::Utf8, false),
+            ArrowField::new("value", DataType::Int32, false),
+        ]));
+
+        let tenant_ids: Vec<&str> = (0..100)
+            .map(|i| match i % 3 {
+                0 => "acme",
+                1 => "globex",
+                _ => "initech",
+            })
+            .collect();
+        let statuses: Vec<&str> = (0..100)
+            .map(|i| match i % 2 {
+                0 => "active",
+                _ => "inactive",
+            })
+            .collect();
+        let values: Vec<i32> = (0..100).collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(tenant_ids)),
+                Arc::new(StringArray::from(statuses)),
+                Arc::new(Int32Array::from(values)),
+            ],
+        )
+        .unwrap();
+
+        let write_params = WriteParams {
+            max_rows_per_file: 50,
+            max_rows_per_group: 25,
+            ..Default::default()
+        };
+
+        // Write dataset
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(batches, &dataset_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        // Create compound index on tenant_id and status
+        let params = ScalarIndexParams::default();
+        dataset
+            .create_index(
+                &["tenant_id", "status"],
+                IndexType::BTree,
+                Some("compound_idx".to_string()),
+                &params,
+                false, // replace
+            )
+            .await
+            .unwrap();
+
+        // Verify index exists
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+
+        let compound_idx = &indices[0];
+        assert_eq!(compound_idx.name, "compound_idx");
+        assert_eq!(
+            compound_idx.fields.len(),
+            2,
+            "Compound index should have 2 fields"
+        );
+
+        // Verify we can load the index details
+        let index_details = compound_idx.index_details.as_ref().expect("should have details");
+        assert!(
+            index_details.type_url.contains("CompoundBTreeIndexDetails"),
+            "Index details should be CompoundBTreeIndexDetails, got: {}",
+            index_details.type_url
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compound_index_rejects_unsupported_types() {
+        // Create temporary directory for dataset
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        // Create minimal test data
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("col1", DataType::Utf8, false),
+            ArrowField::new("col2", DataType::Utf8, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                Arc::new(StringArray::from(vec!["x", "y", "z"])),
+            ],
+        )
+        .unwrap();
+
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(batches, &dataset_uri, None).await.unwrap();
+
+        // Try to create compound index with vector type - should fail
+        let params = VectorIndexParams::ivf_flat(8, MetricType::Cosine);
+        let result = dataset
+            .create_index(
+                &["col1", "col2"],
+                IndexType::Vector,
+                None,
+                &params,
+                false,
+            )
+            .await;
+
+        assert!(result.is_err(), "Vector index should not support multiple columns");
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("does not support multiple columns"),
+            "Error should mention multi-column not supported: {}",
+            err
+        );
     }
 }
