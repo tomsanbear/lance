@@ -189,3 +189,12 @@ message JsonIndexDetails {
   google.protobuf.Any target_details = 2;
 }
 message BloomFilterIndexDetails {}
+
+// Compound (multi-column) B-tree index details.
+// Stores per-column information for the compound index.
+message CompoundBTreeIndexDetails {
+  // Names of the columns in index order
+  repeated string column_names = 1;
+  // Number of columns in the compound index
+  uint32 num_columns = 2;
+}
