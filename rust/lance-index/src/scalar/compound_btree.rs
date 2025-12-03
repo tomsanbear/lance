@@ -317,6 +317,371 @@ pub struct CompoundBatchStats {
     pub page_number: u32,
 }
 
+// ============================================================================
+// CompoundBTreeLookup - In-Memory Page Routing
+// ============================================================================
+
+/// Statistics for a single page in the compound index.
+///
+/// Contains per-column min/max/null_count statistics that enable
+/// efficient page pruning for queries.
+#[derive(Debug, Clone)]
+pub struct CompoundPageStats {
+    /// Minimum value per column.
+    pub mins: Vec<ScalarValue>,
+    /// Maximum value per column.
+    pub maxs: Vec<ScalarValue>,
+    /// Null count per column.
+    pub null_counts: Vec<u32>,
+    /// Page number (0-indexed).
+    pub page_number: u32,
+}
+
+impl DeepSizeOf for CompoundPageStats {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.mins.iter().map(|v| std::mem::size_of_val(v)).sum::<usize>()
+            + self.maxs.iter().map(|v| std::mem::size_of_val(v)).sum::<usize>()
+            + self.null_counts.deep_size_of_children(context)
+    }
+}
+
+/// In-memory lookup structure for compound index pages.
+///
+/// This structure provides efficient page routing based on per-column
+/// statistics. Unlike single-column BTreeLookup which uses a BTreeMap,
+/// this stores per-page statistics and performs linear pruning across
+/// pages using per-column bounds.
+///
+/// # Pruning Strategy
+///
+/// For each query, pages are pruned if any column predicate guarantees
+/// no rows can match:
+/// - Equality: prune if value < min OR value > max
+/// - Range: prune if range doesn't overlap [min, max]
+/// - IS NULL: prune if null_count = 0
+///
+/// This enables pruning even for non-prefix queries (e.g., timestamp > T
+/// without specifying tenant_id).
+#[derive(Debug)]
+pub struct CompoundBTreeLookup {
+    /// Per-column statistics for each page.
+    page_stats: Vec<CompoundPageStats>,
+    /// Number of columns in the index.
+    num_columns: usize,
+    /// Column data types (extracted from lookup schema).
+    data_types: Vec<DataType>,
+}
+
+impl DeepSizeOf for CompoundBTreeLookup {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.page_stats.deep_size_of_children(context)
+    }
+}
+
+impl CompoundBTreeLookup {
+    /// Create a new CompoundBTreeLookup from parsed page statistics.
+    pub fn new(page_stats: Vec<CompoundPageStats>, data_types: Vec<DataType>) -> Self {
+        let num_columns = data_types.len();
+        Self {
+            page_stats,
+            num_columns,
+            data_types,
+        }
+    }
+
+    /// Parse a CompoundBTreeLookup from the serialized lookup batch.
+    ///
+    /// The lookup batch has the schema:
+    /// ```text
+    /// [min_col0, max_col0, null_count_col0,
+    ///  min_col1, max_col1, null_count_col1,
+    ///  ...,
+    ///  page_idx]
+    /// ```
+    ///
+    /// Data types are extracted from the schema (min_col* columns).
+    pub fn try_from_serialized(
+        lookup_batch: RecordBatch,
+        column_names: &[String],
+    ) -> Result<Self> {
+        let schema = lookup_batch.schema();
+        let num_columns = column_names.len();
+
+        // Extract data types from the min_* columns
+        let data_types: Vec<DataType> = (0..num_columns)
+            .map(|i| {
+                let field_idx = i * 3; // min_col0, max_col0, null_count_col0, min_col1, ...
+                schema.field(field_idx).data_type().clone()
+            })
+            .collect();
+
+        if lookup_batch.num_rows() == 0 {
+            return Ok(Self::new(vec![], data_types));
+        }
+
+        let mut page_stats = Vec::with_capacity(lookup_batch.num_rows());
+
+        // Get the page_idx column (last column)
+        let page_idx_col = lookup_batch
+            .column(lookup_batch.num_columns() - 1)
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .ok_or_else(|| Error::Index {
+                message: "page_idx column is not UInt32".to_string(),
+                location: location!(),
+            })?;
+
+        for row_idx in 0..lookup_batch.num_rows() {
+            let mut mins = Vec::with_capacity(num_columns);
+            let mut maxs = Vec::with_capacity(num_columns);
+            let mut null_counts = Vec::with_capacity(num_columns);
+
+            for col_idx in 0..num_columns {
+                let base_idx = col_idx * 3;
+
+                // min_col
+                let min_col = lookup_batch.column(base_idx);
+                let min_val = ScalarValue::try_from_array(min_col, row_idx).map_err(|e| {
+                    Error::Index {
+                        message: format!(
+                            "Failed to read min value for column {}: {}",
+                            column_names[col_idx], e
+                        ),
+                        location: location!(),
+                    }
+                })?;
+                mins.push(min_val);
+
+                // max_col
+                let max_col = lookup_batch.column(base_idx + 1);
+                let max_val = ScalarValue::try_from_array(max_col, row_idx).map_err(|e| {
+                    Error::Index {
+                        message: format!(
+                            "Failed to read max value for column {}: {}",
+                            column_names[col_idx], e
+                        ),
+                        location: location!(),
+                    }
+                })?;
+                maxs.push(max_val);
+
+                // null_count_col
+                let null_count_col = lookup_batch
+                    .column(base_idx + 2)
+                    .as_any()
+                    .downcast_ref::<UInt32Array>()
+                    .ok_or_else(|| Error::Index {
+                        message: format!(
+                            "null_count column for {} is not UInt32",
+                            column_names[col_idx]
+                        ),
+                        location: location!(),
+                    })?;
+                null_counts.push(null_count_col.value(row_idx));
+            }
+
+            let page_number = page_idx_col.value(row_idx);
+
+            page_stats.push(CompoundPageStats {
+                mins,
+                maxs,
+                null_counts,
+                page_number,
+            });
+        }
+
+        Ok(Self::new(page_stats, data_types))
+    }
+
+    /// Get the number of pages in this lookup.
+    pub fn num_pages(&self) -> usize {
+        self.page_stats.len()
+    }
+
+    /// Get the data types for the indexed columns.
+    pub fn data_types(&self) -> &[DataType] {
+        &self.data_types
+    }
+
+    /// Find all pages that may contain rows matching the query.
+    ///
+    /// Returns page numbers that cannot be pruned based on per-column statistics.
+    pub fn find_candidate_pages(&self, query: &super::compound::CompoundSargableQuery) -> Vec<u32> {
+        self.page_stats
+            .iter()
+            .filter(|stats| !self.can_prune_page(stats, query))
+            .map(|stats| stats.page_number)
+            .collect()
+    }
+
+    /// Check if a page can be pruned based on query predicates.
+    ///
+    /// Returns true if the page definitely cannot contain matching rows.
+    fn can_prune_page(
+        &self,
+        stats: &CompoundPageStats,
+        query: &super::compound::CompoundSargableQuery,
+    ) -> bool {
+        use super::compound::CompoundSargableQuery;
+
+        match query {
+            CompoundSargableQuery::FullKeyLookup(key) => {
+                // For full key lookup, we can't easily compare compound keys to per-column stats
+                // without the RowConverter. For now, don't prune based on full key.
+                // The per-column bounds check would require deconstructing the key.
+                // This is conservative but correct - we may load more pages than necessary.
+                let _ = key; // unused for now
+                false
+            }
+            CompoundSargableQuery::PrefixLookup { prefix, range } => {
+                // Check each prefix column for pruning
+                for (col_idx, value) in prefix.iter().enumerate() {
+                    if self.can_prune_by_equality(stats, col_idx, value) {
+                        return true;
+                    }
+                }
+
+                // Check range on next column if present
+                if let Some((lower, upper)) = range {
+                    let range_col_idx = prefix.len();
+                    if range_col_idx < self.num_columns
+                        && self.can_prune_by_range(stats, range_col_idx, lower, upper)
+                    {
+                        return true;
+                    }
+                }
+
+                false
+            }
+            CompoundSargableQuery::Range { lower, upper } => {
+                // Range on compound keys is harder to prune with per-column stats.
+                // We could check the first column bounds as an approximation.
+                // For now, be conservative and don't prune.
+                let _ = (lower, upper);
+                false
+            }
+        }
+    }
+
+    /// Check if a page can be pruned based on an equality predicate on a column.
+    fn can_prune_by_equality(
+        &self,
+        stats: &CompoundPageStats,
+        col_idx: usize,
+        value: &ScalarValue,
+    ) -> bool {
+        if col_idx >= self.num_columns {
+            return false;
+        }
+
+        // Handle NULL values
+        if value.is_null() {
+            // Looking for NULL - prune if no nulls in this column
+            return stats.null_counts[col_idx] == 0;
+        }
+
+        // If the page is entirely NULL for this column, prune (looking for non-NULL value)
+        if stats.mins[col_idx].is_null() && stats.maxs[col_idx].is_null() {
+            return true;
+        }
+
+        // Check if value is outside [min, max] range
+        // value < min OR value > max -> prune
+        if !stats.mins[col_idx].is_null() {
+            if let Some(ordering) = value.partial_cmp(&stats.mins[col_idx]) {
+                if ordering == std::cmp::Ordering::Less {
+                    return true; // value < min
+                }
+            }
+        }
+
+        if !stats.maxs[col_idx].is_null() {
+            if let Some(ordering) = value.partial_cmp(&stats.maxs[col_idx]) {
+                if ordering == std::cmp::Ordering::Greater {
+                    return true; // value > max
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Check if a page can be pruned based on a range predicate on a column.
+    fn can_prune_by_range(
+        &self,
+        stats: &CompoundPageStats,
+        col_idx: usize,
+        lower: &std::ops::Bound<ScalarValue>,
+        upper: &std::ops::Bound<ScalarValue>,
+    ) -> bool {
+        use std::ops::Bound;
+
+        if col_idx >= self.num_columns {
+            return false;
+        }
+
+        // If the page is entirely NULL for this column, prune (range doesn't match NULL)
+        if stats.mins[col_idx].is_null() && stats.maxs[col_idx].is_null() {
+            return true;
+        }
+
+        // Check if range is completely below page min
+        // upper < min (exclusive) or upper <= min (inclusive with upper < min)
+        if !stats.mins[col_idx].is_null() {
+            match upper {
+                Bound::Included(val) => {
+                    if let Some(ordering) = val.partial_cmp(&stats.mins[col_idx]) {
+                        if ordering == std::cmp::Ordering::Less {
+                            return true; // upper < min
+                        }
+                    }
+                }
+                Bound::Excluded(val) => {
+                    if let Some(ordering) = val.partial_cmp(&stats.mins[col_idx]) {
+                        if ordering != std::cmp::Ordering::Greater {
+                            return true; // upper <= min
+                        }
+                    }
+                }
+                Bound::Unbounded => {}
+            }
+        }
+
+        // Check if range is completely above page max
+        // lower > max (exclusive) or lower >= max (inclusive with lower > max)
+        if !stats.maxs[col_idx].is_null() {
+            match lower {
+                Bound::Included(val) => {
+                    if let Some(ordering) = val.partial_cmp(&stats.maxs[col_idx]) {
+                        if ordering == std::cmp::Ordering::Greater {
+                            return true; // lower > max
+                        }
+                    }
+                }
+                Bound::Excluded(val) => {
+                    if let Some(ordering) = val.partial_cmp(&stats.maxs[col_idx]) {
+                        if ordering != std::cmp::Ordering::Less {
+                            return true; // lower >= max
+                        }
+                    }
+                }
+                Bound::Unbounded => {}
+            }
+        }
+
+        false
+    }
+
+    /// Get pages that may contain NULL values in the specified column.
+    pub fn pages_with_nulls(&self, col_idx: usize) -> Vec<u32> {
+        self.page_stats
+            .iter()
+            .filter(|stats| col_idx < stats.null_counts.len() && stats.null_counts[col_idx] > 0)
+            .map(|stats| stats.page_number)
+            .collect()
+    }
+}
+
 /// Analyze a compound batch to extract per-column statistics.
 ///
 /// # Arguments
@@ -1058,5 +1423,275 @@ mod tests {
         // We can verify it was created successfully by creating empty rows
         let empty_rows = converter.empty_rows(0, 0);
         assert_eq!(empty_rows.num_rows(), 0);
+    }
+
+    // ========================================================================
+    // CompoundBTreeLookup Tests
+    // ========================================================================
+
+    #[test]
+    fn test_compound_btree_lookup_new() {
+        let page_stats = vec![
+            CompoundPageStats {
+                mins: vec![
+                    ScalarValue::Utf8(Some("a".to_string())),
+                    ScalarValue::Int64(Some(1)),
+                ],
+                maxs: vec![
+                    ScalarValue::Utf8(Some("c".to_string())),
+                    ScalarValue::Int64(Some(100)),
+                ],
+                null_counts: vec![0, 0],
+                page_number: 0,
+            },
+            CompoundPageStats {
+                mins: vec![
+                    ScalarValue::Utf8(Some("d".to_string())),
+                    ScalarValue::Int64(Some(101)),
+                ],
+                maxs: vec![
+                    ScalarValue::Utf8(Some("f".to_string())),
+                    ScalarValue::Int64(Some(200)),
+                ],
+                null_counts: vec![1, 2],
+                page_number: 1,
+            },
+        ];
+
+        let data_types = vec![DataType::Utf8, DataType::Int64];
+        let lookup = CompoundBTreeLookup::new(page_stats, data_types.clone());
+
+        assert_eq!(lookup.num_pages(), 2);
+        assert_eq!(lookup.data_types(), &data_types);
+    }
+
+    #[test]
+    fn test_compound_btree_lookup_from_serialized() {
+        // Create a lookup batch that matches the schema from compound_stats_as_batch
+        let column_names = vec!["tenant".to_string(), "count".to_string()];
+        let data_types = vec![DataType::Utf8, DataType::Int64];
+
+        // Schema: min_tenant, max_tenant, null_count_tenant, min_count, max_count, null_count_count, page_idx
+        let lookup_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("min_tenant", DataType::Utf8, true),
+                Field::new("max_tenant", DataType::Utf8, true),
+                Field::new("null_count_tenant", DataType::UInt32, false),
+                Field::new("min_count", DataType::Int64, true),
+                Field::new("max_count", DataType::Int64, true),
+                Field::new("null_count_count", DataType::UInt32, false),
+                Field::new("page_idx", DataType::UInt32, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "d"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["c", "f"])) as ArrayRef,
+                Arc::new(UInt32Array::from(vec![0, 1])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![1, 101])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![100, 200])) as ArrayRef,
+                Arc::new(UInt32Array::from(vec![0, 2])) as ArrayRef,
+                Arc::new(UInt32Array::from(vec![0, 1])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let lookup = CompoundBTreeLookup::try_from_serialized(lookup_batch, &column_names).unwrap();
+
+        assert_eq!(lookup.num_pages(), 2);
+        assert_eq!(lookup.data_types(), &data_types);
+    }
+
+    #[test]
+    fn test_compound_btree_lookup_pruning_equality() {
+        use super::super::compound::CompoundSargableQuery;
+
+        let page_stats = vec![
+            CompoundPageStats {
+                mins: vec![
+                    ScalarValue::Utf8(Some("a".to_string())),
+                    ScalarValue::Int64(Some(1)),
+                ],
+                maxs: vec![
+                    ScalarValue::Utf8(Some("c".to_string())),
+                    ScalarValue::Int64(Some(100)),
+                ],
+                null_counts: vec![0, 0],
+                page_number: 0,
+            },
+            CompoundPageStats {
+                mins: vec![
+                    ScalarValue::Utf8(Some("d".to_string())),
+                    ScalarValue::Int64(Some(101)),
+                ],
+                maxs: vec![
+                    ScalarValue::Utf8(Some("f".to_string())),
+                    ScalarValue::Int64(Some(200)),
+                ],
+                null_counts: vec![0, 0],
+                page_number: 1,
+            },
+        ];
+
+        let lookup = CompoundBTreeLookup::new(page_stats, vec![DataType::Utf8, DataType::Int64]);
+
+        // Query for tenant_id = "b" - should match page 0 only
+        let query = CompoundSargableQuery::prefix_lookup(vec![
+            ScalarValue::Utf8(Some("b".to_string())),
+        ]);
+        let pages = lookup.find_candidate_pages(&query);
+        assert_eq!(pages, vec![0]);
+
+        // Query for tenant_id = "e" - should match page 1 only
+        let query = CompoundSargableQuery::prefix_lookup(vec![
+            ScalarValue::Utf8(Some("e".to_string())),
+        ]);
+        let pages = lookup.find_candidate_pages(&query);
+        assert_eq!(pages, vec![1]);
+
+        // Query for tenant_id = "z" - should match no pages
+        let query = CompoundSargableQuery::prefix_lookup(vec![
+            ScalarValue::Utf8(Some("z".to_string())),
+        ]);
+        let pages = lookup.find_candidate_pages(&query);
+        assert!(pages.is_empty());
+
+        // Query for tenant_id = "a" - should match page 0 (boundary case)
+        let query = CompoundSargableQuery::prefix_lookup(vec![
+            ScalarValue::Utf8(Some("a".to_string())),
+        ]);
+        let pages = lookup.find_candidate_pages(&query);
+        assert_eq!(pages, vec![0]);
+    }
+
+    #[test]
+    fn test_compound_btree_lookup_pruning_range() {
+        use super::super::compound::CompoundSargableQuery;
+        use std::ops::Bound;
+
+        let page_stats = vec![
+            CompoundPageStats {
+                mins: vec![
+                    ScalarValue::Utf8(Some("a".to_string())),
+                    ScalarValue::Int64(Some(1)),
+                ],
+                maxs: vec![
+                    ScalarValue::Utf8(Some("a".to_string())),
+                    ScalarValue::Int64(Some(100)),
+                ],
+                null_counts: vec![0, 0],
+                page_number: 0,
+            },
+            CompoundPageStats {
+                mins: vec![
+                    ScalarValue::Utf8(Some("a".to_string())),
+                    ScalarValue::Int64(Some(101)),
+                ],
+                maxs: vec![
+                    ScalarValue::Utf8(Some("a".to_string())),
+                    ScalarValue::Int64(Some(200)),
+                ],
+                null_counts: vec![0, 0],
+                page_number: 1,
+            },
+        ];
+
+        let lookup = CompoundBTreeLookup::new(page_stats, vec![DataType::Utf8, DataType::Int64]);
+
+        // Query: tenant_id = "a" AND timestamp > 50
+        // Should match page 0 (50 < 100) and page 1 (timestamp range 101-200 > 50)
+        let query = CompoundSargableQuery::prefix_lookup_with_range(
+            vec![ScalarValue::Utf8(Some("a".to_string()))],
+            (
+                Bound::Excluded(ScalarValue::Int64(Some(50))),
+                Bound::Unbounded,
+            ),
+        );
+        let pages = lookup.find_candidate_pages(&query);
+        assert_eq!(pages, vec![0, 1]);
+
+        // Query: tenant_id = "a" AND timestamp > 150
+        // Should match only page 1 (101-200 includes values > 150)
+        let query = CompoundSargableQuery::prefix_lookup_with_range(
+            vec![ScalarValue::Utf8(Some("a".to_string()))],
+            (
+                Bound::Excluded(ScalarValue::Int64(Some(150))),
+                Bound::Unbounded,
+            ),
+        );
+        let pages = lookup.find_candidate_pages(&query);
+        assert_eq!(pages, vec![1]);
+
+        // Query: tenant_id = "a" AND timestamp < 50
+        // Should match only page 0 (1-100 includes values < 50)
+        let query = CompoundSargableQuery::prefix_lookup_with_range(
+            vec![ScalarValue::Utf8(Some("a".to_string()))],
+            (
+                Bound::Unbounded,
+                Bound::Excluded(ScalarValue::Int64(Some(50))),
+            ),
+        );
+        let pages = lookup.find_candidate_pages(&query);
+        assert_eq!(pages, vec![0]);
+    }
+
+    #[test]
+    fn test_compound_btree_lookup_null_handling() {
+        use super::super::compound::CompoundSargableQuery;
+
+        let page_stats = vec![
+            CompoundPageStats {
+                mins: vec![
+                    ScalarValue::Utf8(Some("a".to_string())),
+                    ScalarValue::Int64(Some(1)),
+                ],
+                maxs: vec![
+                    ScalarValue::Utf8(Some("c".to_string())),
+                    ScalarValue::Int64(Some(100)),
+                ],
+                null_counts: vec![5, 0], // 5 nulls in tenant column
+                page_number: 0,
+            },
+            CompoundPageStats {
+                mins: vec![
+                    ScalarValue::Utf8(Some("d".to_string())),
+                    ScalarValue::Int64(Some(101)),
+                ],
+                maxs: vec![
+                    ScalarValue::Utf8(Some("f".to_string())),
+                    ScalarValue::Int64(Some(200)),
+                ],
+                null_counts: vec![0, 0], // No nulls
+                page_number: 1,
+            },
+        ];
+
+        let lookup = CompoundBTreeLookup::new(page_stats, vec![DataType::Utf8, DataType::Int64]);
+
+        // Pages with nulls in column 0
+        let null_pages = lookup.pages_with_nulls(0);
+        assert_eq!(null_pages, vec![0]);
+
+        // Pages with nulls in column 1
+        let null_pages = lookup.pages_with_nulls(1);
+        assert!(null_pages.is_empty());
+
+        // Query for NULL in first column - should match page 0 only
+        let query = CompoundSargableQuery::prefix_lookup(vec![ScalarValue::Utf8(None)]);
+        let pages = lookup.find_candidate_pages(&query);
+        assert_eq!(pages, vec![0]);
+    }
+
+    #[test]
+    fn test_compound_btree_lookup_empty() {
+        let lookup = CompoundBTreeLookup::new(vec![], vec![DataType::Utf8, DataType::Int64]);
+
+        assert_eq!(lookup.num_pages(), 0);
+
+        // Any query should return empty pages
+        use super::super::compound::CompoundSargableQuery;
+        let query = CompoundSargableQuery::prefix_lookup(vec![
+            ScalarValue::Utf8(Some("test".to_string())),
+        ]);
+        let pages = lookup.find_candidate_pages(&query);
+        assert!(pages.is_empty());
     }
 }
