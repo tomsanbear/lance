@@ -31,6 +31,7 @@ use crate::{Index, IndexParams, IndexType};
 pub mod bitmap;
 pub mod bloomfilter;
 pub mod btree;
+pub mod compound;
 pub mod expression;
 pub mod inverted;
 pub mod json;

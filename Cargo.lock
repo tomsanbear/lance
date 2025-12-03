@@ -2513,7 +2513,7 @@ dependencies = [
  "arrow",
  "datafusion-common",
  "pbjson",
- "prost 0.13.5",
+ "prost",
  "serde",
  "serde_json",
 ]
@@ -4753,6 +4753,7 @@ dependencies = [
  "arrow-arith",
  "arrow-array",
  "arrow-ord",
+ "arrow-row",
  "arrow-schema",
  "arrow-select",
  "async-channel",
