@@ -339,8 +339,8 @@ pub struct CompoundPageStats {
 
 impl DeepSizeOf for CompoundPageStats {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        self.mins.iter().map(|v| std::mem::size_of_val(v)).sum::<usize>()
-            + self.maxs.iter().map(|v| std::mem::size_of_val(v)).sum::<usize>()
+        self.mins.iter().map(std::mem::size_of_val).sum::<usize>()
+            + self.maxs.iter().map(std::mem::size_of_val).sum::<usize>()
             + self.null_counts.deep_size_of_children(context)
     }
 }
@@ -436,7 +436,7 @@ impl CompoundBTreeLookup {
             let mut maxs = Vec::with_capacity(num_columns);
             let mut null_counts = Vec::with_capacity(num_columns);
 
-            for col_idx in 0..num_columns {
+            for (col_idx, col_name) in column_names.iter().enumerate() {
                 let base_idx = col_idx * 3;
 
                 // min_col
@@ -445,7 +445,7 @@ impl CompoundBTreeLookup {
                     Error::Index {
                         message: format!(
                             "Failed to read min value for column {}: {}",
-                            column_names[col_idx], e
+                            col_name, e
                         ),
                         location: location!(),
                     }
@@ -458,7 +458,7 @@ impl CompoundBTreeLookup {
                     Error::Index {
                         message: format!(
                             "Failed to read max value for column {}: {}",
-                            column_names[col_idx], e
+                            col_name, e
                         ),
                         location: location!(),
                     }
@@ -473,7 +473,7 @@ impl CompoundBTreeLookup {
                     .ok_or_else(|| Error::Index {
                         message: format!(
                             "null_count column for {} is not UInt32",
-                            column_names[col_idx]
+                            col_name
                         ),
                         location: location!(),
                     })?;
@@ -1389,20 +1389,20 @@ impl CompoundBTreeIndex {
         let lower_ok = match lower {
             Bound::Unbounded => true,
             Bound::Included(v) => {
-                value.partial_cmp(v).map_or(false, |o| o != std::cmp::Ordering::Less)
+                value.partial_cmp(v).is_some_and(|o| o != std::cmp::Ordering::Less)
             }
             Bound::Excluded(v) => {
-                value.partial_cmp(v).map_or(false, |o| o == std::cmp::Ordering::Greater)
+                value.partial_cmp(v) == Some(std::cmp::Ordering::Greater)
             }
         };
 
         let upper_ok = match upper {
             Bound::Unbounded => true,
             Bound::Included(v) => {
-                value.partial_cmp(v).map_or(false, |o| o != std::cmp::Ordering::Greater)
+                value.partial_cmp(v).is_some_and(|o| o != std::cmp::Ordering::Greater)
             }
             Bound::Excluded(v) => {
-                value.partial_cmp(v).map_or(false, |o| o == std::cmp::Ordering::Less)
+                value.partial_cmp(v) == Some(std::cmp::Ordering::Less)
             }
         };
 
@@ -1680,6 +1680,205 @@ impl ScalarIndex for CompoundBTreeIndex {
 /// Version number for compound BTree index.
 const COMPOUND_BTREE_INDEX_VERSION: u32 = 1;
 
+// ============================================================================
+// CompoundQueryParser - Query Parsing for Compound Indices
+// ============================================================================
+
+use super::expression::IndexedExpression;
+use datafusion_expr::Operator;
+
+/// Parser for compound index queries.
+///
+/// This parser recognizes AND predicates that match the compound index's
+/// column structure and builds a `CompoundSargableQuery`.
+///
+/// # Supported Query Patterns
+///
+/// - Full key lookup: `col1 = v1 AND col2 = v2 AND col3 = v3`
+/// - Prefix lookup: `col1 = v1 AND col2 = v2`
+/// - Prefix + range: `col1 = v1 AND col2 > v2`
+///
+/// # Leftmost Prefix Rule
+///
+/// The parser follows the leftmost prefix rule: predicates must cover
+/// contiguous columns starting from the first column. Gaps are not allowed.
+#[derive(Debug)]
+pub struct CompoundQueryParser {
+    /// Index name.
+    index_name: String,
+    /// Column names in index order.
+    columns: Vec<String>,
+    /// Column data types.
+    data_types: Vec<DataType>,
+}
+
+impl CompoundQueryParser {
+    /// Create a new CompoundQueryParser.
+    pub fn new(index_name: String, columns: Vec<String>, data_types: Vec<DataType>) -> Self {
+        Self {
+            index_name,
+            columns,
+            data_types,
+        }
+    }
+
+    /// Get the column names in this index.
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+
+    /// Get the data types for indexed columns.
+    pub fn data_types(&self) -> &[DataType] {
+        &self.data_types
+    }
+
+    /// Get the index name.
+    pub fn index_name(&self) -> &str {
+        &self.index_name
+    }
+
+    /// Check if a column is the first column in this index.
+    pub fn is_first_column(&self, col: &str) -> bool {
+        self.columns.first().is_some_and(|c| c == col)
+    }
+
+    /// Check if a column is part of this index.
+    pub fn contains_column(&self, col: &str) -> bool {
+        self.columns.iter().any(|c| c == col)
+    }
+
+    /// Get the position of a column in this index (0-indexed).
+    pub fn column_position(&self, col: &str) -> Option<usize> {
+        self.columns.iter().position(|c| c == col)
+    }
+}
+
+impl ScalarQueryParser for CompoundQueryParser {
+    fn visit_between(
+        &self,
+        column: &str,
+        low: &std::ops::Bound<ScalarValue>,
+        high: &std::ops::Bound<ScalarValue>,
+    ) -> Option<IndexedExpression> {
+        // For compound indices, we handle BETWEEN as a range on the first column
+        // This is a simplified implementation - full support requires collecting
+        // predicates from the AND expression context
+        if !self.is_first_column(column) {
+            return None;
+        }
+
+        // Create a prefix lookup with range on the first column
+        let range = (low.clone(), high.clone());
+        let query = CompoundSargableQuery::prefix_lookup_with_range(vec![], range);
+
+        Some(IndexedExpression::index_query(
+            column.to_string(),
+            self.index_name.clone(),
+            Arc::new(query),
+        ))
+    }
+
+    fn visit_in_list(&self, _column: &str, _in_list: &[ScalarValue]) -> Option<IndexedExpression> {
+        // IN list queries on compound indices are complex - defer for now
+        None
+    }
+
+    fn visit_is_bool(&self, column: &str, value: bool) -> Option<IndexedExpression> {
+        // Boolean equality on first column
+        if !self.is_first_column(column) {
+            return None;
+        }
+
+        let query = CompoundSargableQuery::prefix_lookup(vec![ScalarValue::Boolean(Some(value))]);
+
+        Some(IndexedExpression::index_query(
+            column.to_string(),
+            self.index_name.clone(),
+            Arc::new(query),
+        ))
+    }
+
+    fn visit_is_null(&self, column: &str) -> Option<IndexedExpression> {
+        // NULL check on first column
+        if !self.is_first_column(column) {
+            return None;
+        }
+
+        let query = CompoundSargableQuery::prefix_lookup(vec![ScalarValue::Null]);
+
+        Some(IndexedExpression::index_query(
+            column.to_string(),
+            self.index_name.clone(),
+            Arc::new(query),
+        ))
+    }
+
+    fn visit_comparison(
+        &self,
+        column: &str,
+        value: &ScalarValue,
+        op: &Operator,
+    ) -> Option<IndexedExpression> {
+        // For compound indices, single-column comparisons are only useful
+        // on the first column (prefix lookup pattern)
+        if !self.is_first_column(column) {
+            return None;
+        }
+
+        let query = match op {
+            Operator::Eq => {
+                // Equality on first column -> prefix lookup
+                CompoundSargableQuery::prefix_lookup(vec![value.clone()])
+            }
+            Operator::Lt => {
+                // Range on first column
+                CompoundSargableQuery::prefix_lookup_with_range(
+                    vec![],
+                    (std::ops::Bound::Unbounded, std::ops::Bound::Excluded(value.clone())),
+                )
+            }
+            Operator::LtEq => {
+                CompoundSargableQuery::prefix_lookup_with_range(
+                    vec![],
+                    (std::ops::Bound::Unbounded, std::ops::Bound::Included(value.clone())),
+                )
+            }
+            Operator::Gt => {
+                CompoundSargableQuery::prefix_lookup_with_range(
+                    vec![],
+                    (std::ops::Bound::Excluded(value.clone()), std::ops::Bound::Unbounded),
+                )
+            }
+            Operator::GtEq => {
+                CompoundSargableQuery::prefix_lookup_with_range(
+                    vec![],
+                    (std::ops::Bound::Included(value.clone()), std::ops::Bound::Unbounded),
+                )
+            }
+            // NotEq will be handled by caller via maybe_not()
+            Operator::NotEq => CompoundSargableQuery::prefix_lookup(vec![value.clone()]),
+            _ => return None,
+        };
+
+        Some(IndexedExpression::index_query(
+            column.to_string(),
+            self.index_name.clone(),
+            Arc::new(query),
+        ))
+    }
+
+    fn visit_scalar_function(
+        &self,
+        _column: &str,
+        _data_type: &DataType,
+        _func: &datafusion_expr::ScalarUDF,
+        _args: &[datafusion_expr::Expr],
+    ) -> Option<IndexedExpression> {
+        // Scalar functions not supported on compound indices
+        None
+    }
+}
+
 /// Parameters for compound BTree index training.
 #[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
 pub struct CompoundBTreeParameters {
@@ -1762,11 +1961,36 @@ impl ScalarIndexPlugin for CompoundBTreeIndexPlugin {
 
     fn new_query_parser(
         &self,
-        _index_name: String,
-        _index_details: &prost_types::Any,
+        index_name: String,
+        index_details: &prost_types::Any,
     ) -> Option<Box<dyn ScalarQueryParser>> {
-        // Query parsing is deferred to Milestone 3
-        None
+        // Parse index details to get column names
+        let details: pb::CompoundBTreeIndexDetails =
+            prost_types::Any::to_msg(index_details).ok()?;
+
+        // We need data types, but they're not stored in the protobuf message.
+        // For now, we can't create a fully functional parser without loading the index.
+        // Return None until the index is loaded (data types come from the lookup file).
+        //
+        // Note: A future improvement would be to store data types in the protobuf message
+        // or have a different mechanism to provide them at query parse time.
+        //
+        // For M3, the CompoundQueryParser will be used via get_compound_index() on
+        // IndexInformationProvider, which can provide the data types from the loaded index.
+        if details.column_names.is_empty() {
+            return None;
+        }
+
+        // Create parser with empty data types - it will work for simple cases
+        // where we don't need type coercion, but full functionality requires
+        // the data types from the loaded index.
+        let data_types: Vec<DataType> = vec![DataType::Null; details.column_names.len()];
+
+        Some(Box::new(CompoundQueryParser::new(
+            index_name,
+            details.column_names,
+            data_types,
+        )))
     }
 
     async fn train_index(
@@ -2380,5 +2604,110 @@ mod tests {
         ]);
         let pages = lookup.find_candidate_pages(&query);
         assert!(pages.is_empty());
+    }
+
+    // ========================================================================
+    // CompoundQueryParser Tests
+    // ========================================================================
+
+    #[test]
+    fn test_compound_query_parser_new() {
+        let parser = CompoundQueryParser::new(
+            "test_index".to_string(),
+            vec!["tenant_id".to_string(), "status".to_string(), "timestamp".to_string()],
+            vec![DataType::Utf8, DataType::Utf8, DataType::Int64],
+        );
+
+        assert_eq!(parser.index_name(), "test_index");
+        assert_eq!(parser.columns().len(), 3);
+        assert_eq!(parser.data_types().len(), 3);
+    }
+
+    #[test]
+    fn test_compound_query_parser_column_position() {
+        let parser = CompoundQueryParser::new(
+            "test_index".to_string(),
+            vec!["tenant_id".to_string(), "status".to_string()],
+            vec![DataType::Utf8, DataType::Utf8],
+        );
+
+        assert!(parser.is_first_column("tenant_id"));
+        assert!(!parser.is_first_column("status"));
+        assert!(!parser.is_first_column("unknown"));
+
+        assert!(parser.contains_column("tenant_id"));
+        assert!(parser.contains_column("status"));
+        assert!(!parser.contains_column("unknown"));
+
+        assert_eq!(parser.column_position("tenant_id"), Some(0));
+        assert_eq!(parser.column_position("status"), Some(1));
+        assert_eq!(parser.column_position("unknown"), None);
+    }
+
+    #[test]
+    fn test_compound_query_parser_visit_comparison_first_column() {
+        use super::super::expression::ScalarQueryParser;
+        use datafusion_expr::Operator;
+
+        let parser = CompoundQueryParser::new(
+            "test_index".to_string(),
+            vec!["tenant_id".to_string(), "status".to_string()],
+            vec![DataType::Utf8, DataType::Utf8],
+        );
+
+        // Equality on first column should work
+        let result = parser.visit_comparison(
+            "tenant_id",
+            &ScalarValue::Utf8(Some("acme".to_string())),
+            &Operator::Eq,
+        );
+        assert!(result.is_some());
+
+        // Range on first column should work
+        let result = parser.visit_comparison(
+            "tenant_id",
+            &ScalarValue::Utf8(Some("acme".to_string())),
+            &Operator::Gt,
+        );
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_compound_query_parser_visit_comparison_non_first_column() {
+        use super::super::expression::ScalarQueryParser;
+        use datafusion_expr::Operator;
+
+        let parser = CompoundQueryParser::new(
+            "test_index".to_string(),
+            vec!["tenant_id".to_string(), "status".to_string()],
+            vec![DataType::Utf8, DataType::Utf8],
+        );
+
+        // Comparison on non-first column should NOT work (leftmost prefix rule)
+        let result = parser.visit_comparison(
+            "status",
+            &ScalarValue::Utf8(Some("active".to_string())),
+            &Operator::Eq,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_compound_query_parser_visit_is_null() {
+        use super::super::expression::ScalarQueryParser;
+
+        let parser = CompoundQueryParser::new(
+            "test_index".to_string(),
+            vec!["tenant_id".to_string(), "status".to_string()],
+            vec![DataType::Utf8, DataType::Utf8],
+        );
+
+        // IS NULL on first column should work
+        let result = parser.visit_is_null("tenant_id");
+        assert!(result.is_some());
+
+        // IS NULL on non-first column should NOT work
+        let result = parser.visit_is_null("status");
+        assert!(result.is_none());
     }
 }

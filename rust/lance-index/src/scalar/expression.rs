@@ -678,7 +678,7 @@ impl IndexedExpression {
     }
 
     /// Create an expression that is only an index query
-    fn index_query(column: String, index_name: String, query: Arc<dyn AnyQuery>) -> Self {
+    pub fn index_query(column: String, index_name: String, query: Arc<dyn AnyQuery>) -> Self {
         Self {
             scalar_query: Some(ScalarIndexExpr::Query(ScalarIndexSearch {
                 column,
@@ -691,7 +691,7 @@ impl IndexedExpression {
     }
 
     /// Create an expression that is only an index query with explicit needs_recheck
-    fn index_query_with_recheck(
+    pub fn index_query_with_recheck(
         column: String,
         index_name: String,
         query: Arc<dyn AnyQuery>,
@@ -1562,6 +1562,30 @@ pub trait IndexInformationProvider {
     /// Check if an index exists for `col` and, if so, return the data type of col
     /// as well as a query parser that can parse queries for that column
     fn get_index(&self, col: &str) -> Option<(&DataType, &dyn ScalarQueryParser)>;
+
+    /// Check if a compound index exists for the given columns.
+    ///
+    /// Returns the index name, column data types, and a query parser if a compound
+    /// index exists that covers all the specified columns (in order).
+    ///
+    /// This is used to enable compound index queries like:
+    /// `WHERE tenant_id = 'acme' AND status = 'active' AND timestamp > '2024-01-01'`
+    ///
+    /// Default implementation returns None (no compound index support).
+    fn get_compound_index(&self, _cols: &[&str]) -> Option<CompoundIndexInfo<'_>> {
+        None
+    }
+}
+
+/// Information about a compound index.
+#[derive(Debug)]
+pub struct CompoundIndexInfo<'a> {
+    /// Index name.
+    pub index_name: &'a str,
+    /// Column data types in index order.
+    pub data_types: &'a [DataType],
+    /// Query parser for the compound index.
+    pub parser: &'a dyn ScalarQueryParser,
 }
 
 /// Attempt to split a filter expression into a search of scalar indexes and an
