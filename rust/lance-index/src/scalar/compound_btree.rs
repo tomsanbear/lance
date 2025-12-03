@@ -212,24 +212,30 @@ impl CompoundBTreeSubIndex for CompoundFlatIndexMetadata {
     }
 
     async fn train(&self, batch: RecordBatch) -> Result<RecordBatch> {
-        // Extract value columns by name and the row ID column
+        // Extract columns by position - input may have generic names (col0, col1, ...)
+        // or original names, but the order is always: [value_cols..., _rowid]
         let mut columns = Vec::with_capacity(self.num_columns + 1);
 
-        for col_name in &self.column_names {
-            let col = batch.column_by_name(col_name).ok_or_else(|| Error::Index {
-                message: format!("Missing column '{}' in training batch", col_name),
-                location: location!(),
-            })?;
-            columns.push(col.clone());
+        // Take value columns by position
+        for i in 0..self.num_columns {
+            if i >= batch.num_columns() {
+                return Err(Error::Index {
+                    message: format!(
+                        "Training batch has {} columns, expected at least {}",
+                        batch.num_columns(),
+                        self.num_columns + 1
+                    ),
+                    location: location!(),
+                });
+            }
+            columns.push(batch.column(i).clone());
         }
 
-        // Add row ID column
-        let row_id_col = batch.column_by_name(ROW_ID).ok_or_else(|| Error::Index {
-            message: format!("Missing '{}' column in training batch", ROW_ID),
-            location: location!(),
-        })?;
-        columns.push(row_id_col.clone());
+        // Add row ID column (last column)
+        let row_id_idx = batch.num_columns() - 1;
+        columns.push(batch.column(row_id_idx).clone());
 
+        // Output with original column names from self.schema
         Ok(RecordBatch::try_new(self.schema.clone(), columns)?)
     }
 
@@ -698,7 +704,7 @@ impl CompoundBTreeLookup {
 /// # Returns
 ///
 /// Statistics for each column in the batch.
-fn analyze_compound_batch(batch: &RecordBatch, column_names: &[String]) -> Result<Vec<ColumnStats>> {
+fn analyze_compound_batch(batch: &RecordBatch, num_value_columns: usize) -> Result<Vec<ColumnStats>> {
     if batch.num_rows() == 0 {
         return Err(Error::Internal {
             message: "Received an empty batch in compound btree training".to_string(),
@@ -706,22 +712,19 @@ fn analyze_compound_batch(batch: &RecordBatch, column_names: &[String]) -> Resul
         });
     }
 
-    let mut stats = Vec::with_capacity(column_names.len());
+    let mut stats = Vec::with_capacity(num_value_columns);
 
-    for col_name in column_names {
-        let col = batch.column_by_name(col_name).ok_or_else(|| Error::Internal {
-            message: format!("Missing column '{}' in batch", col_name),
-            location: location!(),
-        })?;
+    for i in 0..num_value_columns {
+        let col = batch.column(i);
 
         // For sorted data: min is first row, max is last row
         let min = ScalarValue::try_from_array(col, 0).map_err(|e| Error::Internal {
-            message: format!("Failed to get min value for column '{}': {}", col_name, e),
+            message: format!("Failed to get min value for column {}: {}", i, e),
             location: location!(),
         })?;
 
         let max = ScalarValue::try_from_array(col, col.len() - 1).map_err(|e| Error::Internal {
-            message: format!("Failed to get max value for column '{}': {}", col_name, e),
+            message: format!("Failed to get max value for column {}: {}", i, e),
             location: location!(),
         })?;
 
@@ -745,11 +748,11 @@ struct EncodedCompoundBatch {
 async fn train_compound_page(
     batch: RecordBatch,
     batch_idx: u32,
-    column_names: &[String],
+    num_value_columns: usize,
     sub_index_trainer: &dyn CompoundBTreeSubIndex,
     writer: &mut dyn IndexWriter,
 ) -> Result<EncodedCompoundBatch> {
-    let stats = analyze_compound_batch(&batch, column_names)?;
+    let stats = analyze_compound_batch(&batch, num_value_columns)?;
     let trained = sub_index_trainer.train(batch).await?;
     writer.write_record_batch(trained).await?;
     Ok(EncodedCompoundBatch {
@@ -940,7 +943,7 @@ pub async fn train_compound_btree_index(
         let encoded = train_compound_page(
             batch,
             batch_idx,
-            &column_names,
+            column_names.len(),
             sub_index_trainer,
             page_data_file.as_mut(),
         )
@@ -1000,9 +1003,17 @@ use crate::scalar::expression::ScalarQueryParser;
 use crate::scalar::registry::{ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest};
 use crate::scalar::{AnyQuery, CreatedIndex, IndexReader, SearchResult, UpdateCriteria};
 use crate::Index;
+use arrow_schema::SortOptions;
+use datafusion::physical_plan::{
+    sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
+    union::UnionExec, ExecutionPlan,
+};
+use datafusion_common::DataFusionError;
+use datafusion_physical_expr::{expressions::Column, PhysicalSortExpr};
 use futures::stream::{self, StreamExt};
 use lance_core::cache::{LanceCache, WeakLanceCache};
 use lance_core::utils::mask::RowAddrTreeMap;
+use lance_datafusion::exec::{execute_plan, LanceExecutionOptions, OneShotExec};
 use roaring::RoaringBitmap;
 use std::any::Any;
 use tracing::debug;
@@ -1563,6 +1574,121 @@ impl Index for CompoundBTreeIndex {
     }
 }
 
+// ============================================================================
+// Update Support Methods for CompoundBTreeIndex
+// ============================================================================
+
+impl CompoundBTreeIndex {
+    /// Create a stream of data from the index.
+    ///
+    /// Returns a stream of batches with schema [col0, col1, ..., colN, _rowid].
+    /// Column names are generic (col0, col1, ...) to match the training input format.
+    async fn into_data_stream(self) -> Result<SendableRecordBatchStream> {
+        let reader = self.store.open_index_file(COMPOUND_PAGES_NAME).await?;
+        let num_batches = reader.num_batches(self.batch_size).await;
+        
+        // Build output schema with generic column names: col0, col1, ..., colN, _rowid
+        let num_value_cols = self.columns.len();
+        let mut fields = Vec::with_capacity(num_value_cols + 1);
+        for (i, dt) in self.data_types.iter().enumerate() {
+            fields.push(Field::new(format!("col{}", i), dt.clone(), true));
+        }
+        fields.push(Field::new(COMPOUND_IDS_COLUMN, DataType::UInt64, false));
+        let new_schema = Arc::new(Schema::new(fields));
+        let new_schema_clone = new_schema.clone();
+
+        // Create stream that reads pages and renames columns
+        let reader = Arc::new(reader);
+        let batch_size = self.batch_size;
+        let source_col_count = num_value_cols;
+
+        let page_stream = stream::iter((0..num_batches).map(move |page_num| {
+            let reader = reader.clone();
+            async move {
+                reader.read_record_batch(page_num as u64, batch_size).await
+            }
+        }));
+
+        let batches = page_stream
+            .buffered(self.store.io_parallelism())
+            .map_err(DataFusionError::from)
+            .map_ok(move |batch| {
+                // Rename columns to generic names
+                let mut columns: Vec<ArrayRef> = Vec::with_capacity(source_col_count + 1);
+                for i in 0..source_col_count {
+                    columns.push(batch.column(i).clone());
+                }
+                // The last column is _rowid
+                columns.push(batch.column(source_col_count).clone());
+                
+                RecordBatch::try_new(new_schema.clone(), columns).unwrap()
+            })
+            .boxed();
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            new_schema_clone,
+            batches,
+        )))
+    }
+
+    /// Create an execution plan from the index data.
+    async fn into_old_data(self) -> Result<Arc<dyn ExecutionPlan>> {
+        let stream = self.into_data_stream().await?;
+        Ok(Arc::new(OneShotExec::new(stream)))
+    }
+
+    /// Combine old index data with new data in sorted order.
+    ///
+    /// Creates a merged stream suitable for retraining the index.
+    async fn combine_old_new(
+        self,
+        new_data: SendableRecordBatchStream,
+        chunk_size: u64,
+    ) -> Result<SendableRecordBatchStream> {
+        let num_value_cols = self.columns.len();
+
+        let new_input = Arc::new(OneShotExec::new(new_data));
+        let old_input = self.into_old_data().await?;
+
+        debug_assert_eq!(
+            old_input.schema().flattened_fields().len(),
+            new_input.schema().flattened_fields().len()
+        );
+
+        // Build sort expressions for all value columns (compound key ordering)
+        let mut sort_exprs = Vec::with_capacity(num_value_cols);
+        for i in 0..num_value_cols {
+            let col_name = format!("col{}", i);
+            sort_exprs.push(PhysicalSortExpr {
+                expr: Arc::new(Column::new(&col_name, i)),
+                options: SortOptions {
+                    descending: false,
+                    nulls_first: true,
+                },
+            });
+        }
+
+        // Union the two inputs and merge them in sorted order
+        let all_data = Arc::new(UnionExec::new(vec![old_input, new_input]));
+        let ordering = datafusion_physical_expr::LexOrdering::new(sort_exprs)
+            .ok_or_else(|| Error::Internal {
+                message: "Failed to create LexOrdering for compound index merge".to_string(),
+                location: location!(),
+            })?;
+        let ordered = Arc::new(SortPreservingMergeExec::new(ordering, all_data));
+
+        let unchunked = execute_plan(
+            ordered,
+            LanceExecutionOptions {
+                use_spilling: true,
+                ..Default::default()
+            },
+        )?;
+
+        Ok(chunk_concat_stream(unchunked, chunk_size as usize))
+    }
+}
+
 // Implement ScalarIndex trait for CompoundBTreeIndex
 #[async_trait]
 impl ScalarIndex for CompoundBTreeIndex {
@@ -1650,13 +1776,42 @@ impl ScalarIndex for CompoundBTreeIndex {
 
     async fn update(
         &self,
-        _new_data: SendableRecordBatchStream,
-        _dest_store: &dyn IndexStore,
+        new_data: SendableRecordBatchStream,
+        dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
-        // Update is deferred to M4
-        Err(Error::NotSupported {
-            source: "Compound index update not yet implemented".into(),
-            location: location!(),
+        // Merge the existing index data with the new data
+        let merged_data_source = self
+            .clone()
+            .combine_old_new(new_data, self.batch_size)
+            .await?;
+
+        // Create compound schema for training
+        let compound_schema = CompoundIndexSchema::new(
+            self.columns.clone(),
+            self.data_types.clone(),
+        )?;
+
+        // Retrain the index with merged data
+        train_compound_btree_index(
+            merged_data_source,
+            self.sub_index.as_ref(),
+            dest_store,
+            &compound_schema,
+            self.batch_size,
+            None,
+        )
+        .await?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pb::CompoundBTreeIndexDetails {
+                column_names: self.columns.clone(),
+                num_columns: self.columns.len() as u32,
+            })
+            .map_err(|e| Error::Internal {
+                message: format!("Failed to serialize index details: {}", e),
+                location: location!(),
+            })?,
+            index_version: COMPOUND_BTREE_INDEX_VERSION,
         })
     }
 
@@ -2107,6 +2262,390 @@ impl ScalarIndexPlugin for CompoundBTreeIndexPlugin {
 }
 
 // ============================================================================
+// Distributed Training Support - Merge Functions
+// ============================================================================
+
+use lance_io::object_store::ObjectStore;
+use object_store::path::Path;
+
+/// Merge multiple partition compound index files into a complete index.
+///
+/// In a distributed training environment, each worker writes partition files
+/// (e.g., `part_123_compound_page_data.lance` and `part_123_compound_page_lookup.lance`).
+/// This function merges them into the final `compound_page_data.lance` and `compound_page_lookup.lance`.
+///
+/// # Arguments
+///
+/// * `object_store` - Object store for listing partition files
+/// * `index_dir` - Directory containing the partition files
+/// * `store` - Index store for reading/writing files
+/// * `batch_readhead` - Optional batch readhead for parallel I/O
+///
+/// # Example
+///
+/// ```no_run
+/// # use lance_index::scalar::compound_btree::merge_compound_index_files;
+/// # use lance_io::object_store::ObjectStore;
+/// # use std::sync::Arc;
+/// # async fn example() -> lance_core::Result<()> {
+/// // After distributed training completes:
+/// // merge_compound_index_files(&object_store, &index_dir, store, None).await?;
+/// # Ok(())
+/// # }
+/// ```
+pub async fn merge_compound_index_files(
+    object_store: &ObjectStore,
+    index_dir: &Path,
+    store: Arc<dyn IndexStore>,
+    batch_readhead: Option<usize>,
+) -> Result<()> {
+    let (part_page_files, part_lookup_files) =
+        list_compound_page_lookup_files(object_store, index_dir).await?;
+    merge_compound_metadata_files(store, &part_page_files, &part_lookup_files, batch_readhead).await
+}
+
+/// List compound index partition files from a directory.
+///
+/// Returns (page_files, lookup_files) vectors.
+async fn list_compound_page_lookup_files(
+    object_store: &ObjectStore,
+    index_dir: &Path,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let mut part_page_files = Vec::new();
+    let mut part_lookup_files = Vec::new();
+
+    let mut list_stream = object_store.list(Some(index_dir.clone()));
+
+    while let Some(item) = list_stream.next().await {
+        match item {
+            Ok(meta) => {
+                let file_name = meta.location.filename().unwrap_or_default();
+                // Filter files matching the pattern part_*_compound_page_data.lance
+                if file_name.starts_with("part_") && file_name.ends_with("_compound_page_data.lance")
+                {
+                    part_page_files.push(file_name.to_string());
+                }
+                // Filter files matching the pattern part_*_compound_page_lookup.lance
+                if file_name.starts_with("part_")
+                    && file_name.ends_with("_compound_page_lookup.lance")
+                {
+                    part_lookup_files.push(file_name.to_string());
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+
+    if part_page_files.is_empty() || part_lookup_files.is_empty() {
+        return Err(Error::Internal {
+            message: format!(
+                "No compound partition files found in index directory: {} (page_files: {}, lookup_files: {})",
+                index_dir, part_page_files.len(), part_lookup_files.len()
+            ),
+            location: location!(),
+        });
+    }
+
+    Ok((part_page_files, part_lookup_files))
+}
+
+/// Extract partition ID from partition file name.
+/// Expected format: "part_{partition_id}_{suffix}.lance"
+fn extract_compound_partition_id(filename: &str) -> Result<u64> {
+    if !filename.starts_with("part_") {
+        return Err(Error::Internal {
+            message: format!("Invalid partition file name format: {}", filename),
+            location: location!(),
+        });
+    }
+
+    let parts: Vec<&str> = filename.split('_').collect();
+    if parts.len() < 3 {
+        return Err(Error::Internal {
+            message: format!("Invalid partition file name format: {}", filename),
+            location: location!(),
+        });
+    }
+
+    parts[1].parse::<u64>().map_err(|_| Error::Internal {
+        message: format!(
+            "Failed to parse partition ID from filename: {}",
+            filename
+        ),
+        location: location!(),
+    })
+}
+
+/// Merge partition files into final compound index files.
+async fn merge_compound_metadata_files(
+    store: Arc<dyn IndexStore>,
+    part_page_files: &[String],
+    part_lookup_files: &[String],
+    batch_readhead: Option<usize>,
+) -> Result<()> {
+    if part_lookup_files.is_empty() || part_page_files.is_empty() {
+        return Err(Error::Internal {
+            message: "No partition files provided for merging".to_string(),
+            location: location!(),
+        });
+    }
+
+    // Validate matching counts
+    if part_lookup_files.len() != part_page_files.len() {
+        return Err(Error::Internal {
+            message: format!(
+                "Number of partition lookup files ({}) does not match page files ({})",
+                part_lookup_files.len(),
+                part_page_files.len()
+            ),
+            location: location!(),
+        });
+    }
+
+    // Create lookup map for page files by partition ID
+    let mut page_files_map = HashMap::new();
+    for page_file in part_page_files {
+        let partition_id = extract_compound_partition_id(page_file)?;
+        page_files_map.insert(partition_id, page_file);
+    }
+
+    // Validate all lookup files have corresponding page files
+    for lookup_file in part_lookup_files {
+        let partition_id = extract_compound_partition_id(lookup_file)?;
+        if !page_files_map.contains_key(&partition_id) {
+            return Err(Error::Internal {
+                message: format!(
+                    "No corresponding page file for lookup file: {} (partition_id: {})",
+                    lookup_file, partition_id
+                ),
+                location: location!(),
+            });
+        }
+    }
+
+    // Extract metadata from first lookup file
+    let first_lookup_reader = store.open_index_file(&part_lookup_files[0]).await?;
+    let batch_size = first_lookup_reader
+        .schema()
+        .metadata
+        .get(COMPOUND_BATCH_SIZE_META_KEY)
+        .map(|bs| bs.parse().unwrap_or(DEFAULT_COMPOUND_BATCH_SIZE))
+        .unwrap_or(DEFAULT_COMPOUND_BATCH_SIZE);
+
+    // Get page schema from first partition
+    let partition_id = extract_compound_partition_id(&part_lookup_files[0])?;
+    let page_file = page_files_map.get(&partition_id).unwrap();
+    let page_reader = store.open_index_file(page_file).await?;
+    let page_schema = page_reader.schema().clone();
+    let arrow_schema = Arc::new(Schema::from(&page_schema));
+
+    // Determine column names and data types from page schema
+    let num_value_cols = arrow_schema.fields().len() - 1; // All except _rowid
+    let column_names: Vec<String> = (0..num_value_cols)
+        .map(|i| arrow_schema.field(i).name().clone())
+        .collect();
+    let data_types: Vec<DataType> = (0..num_value_cols)
+        .map(|i| arrow_schema.field(i).data_type().clone())
+        .collect();
+
+    // Create output page file
+    let mut output_page_file = store
+        .new_index_file(COMPOUND_PAGES_NAME, arrow_schema.clone())
+        .await?;
+
+    // Merge pages and collect statistics
+    let encoded_batches = merge_compound_pages(
+        part_lookup_files,
+        &page_files_map,
+        &store,
+        batch_size,
+        &mut output_page_file,
+        arrow_schema,
+        &column_names,
+        batch_readhead,
+    )
+    .await?;
+
+    output_page_file.finish().await?;
+
+    // Create lookup file with per-column statistics
+    let lookup_batch = compound_stats_as_batch(encoded_batches, &column_names, &data_types)?;
+
+    let mut file_schema = lookup_batch.schema().as_ref().clone();
+    file_schema.metadata.insert(
+        COMPOUND_BATCH_SIZE_META_KEY.to_string(),
+        batch_size.to_string(),
+    );
+
+    let mut lookup_file = store
+        .new_index_file(COMPOUND_LOOKUP_NAME, Arc::new(file_schema))
+        .await?;
+
+    lookup_file.write_record_batch(lookup_batch).await?;
+    lookup_file.finish().await?;
+
+    // Clean up partition files
+    cleanup_compound_partition_files(&store, part_lookup_files, part_page_files).await;
+
+    Ok(())
+}
+
+/// Merge compound pages using SortPreservingMergeExec.
+#[allow(clippy::too_many_arguments)]
+async fn merge_compound_pages(
+    part_lookup_files: &[String],
+    page_files_map: &HashMap<u64, &String>,
+    store: &Arc<dyn IndexStore>,
+    batch_size: u64,
+    page_file: &mut Box<dyn IndexWriter>,
+    arrow_schema: Arc<Schema>,
+    column_names: &[String],
+    batch_readhead: Option<usize>,
+) -> Result<Vec<EncodedCompoundBatch>> {
+    let mut encoded_batches = Vec::new();
+    let mut page_idx = 0u32;
+
+    debug!(
+        "Starting compound SortPreservingMerge with {} partitions",
+        part_lookup_files.len()
+    );
+
+    let num_value_cols = column_names.len();
+
+    // Build stream schema with generic column names
+    let mut stream_fields = Vec::with_capacity(num_value_cols + 1);
+    for i in 0..num_value_cols {
+        stream_fields.push(arrow_schema.field(i).clone().with_name(format!("col{}", i)));
+    }
+    stream_fields.push(Field::new(COMPOUND_IDS_COLUMN, DataType::UInt64, false));
+    let stream_schema = Arc::new(Schema::new(stream_fields));
+
+    // Create execution plans for each partition
+    let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+    for lookup_file in part_lookup_files {
+        let partition_id = extract_compound_partition_id(lookup_file)?;
+        let page_file_name = (*page_files_map.get(&partition_id).ok_or_else(|| {
+            Error::Internal {
+                message: format!("Page file not found for partition ID: {}", partition_id),
+                location: location!(),
+            }
+        })?)
+        .clone();
+
+        let reader = store.open_index_file(&page_file_name).await?;
+        let num_batches = reader.num_batches(batch_size).await;
+        let reader = Arc::new(reader);
+
+        let page_stream = stream::iter((0..num_batches).map({
+            let reader = reader.clone();
+            move |page_num| {
+                let reader = reader.clone();
+                async move { reader.read_record_batch(page_num as u64, batch_size).await }
+            }
+        }));
+
+        let stream_schema_clone = stream_schema.clone();
+        let stream = page_stream
+            .buffered(batch_readhead.unwrap_or(1))
+            .map_err(DataFusionError::from)
+            .map_ok(move |batch| {
+                // Rename columns to generic names
+                let mut columns: Vec<ArrayRef> = Vec::with_capacity(num_value_cols + 1);
+                for i in 0..num_value_cols {
+                    columns.push(batch.column(i).clone());
+                }
+                columns.push(batch.column(num_value_cols).clone());
+                RecordBatch::try_new(stream_schema_clone.clone(), columns).unwrap()
+            })
+            .boxed();
+
+        let sendable_stream = Box::pin(RecordBatchStreamAdapter::new(stream_schema.clone(), stream));
+        inputs.push(Arc::new(OneShotExec::new(sendable_stream)));
+    }
+
+    // Create Union and SortPreservingMerge
+    let union_inputs = Arc::new(UnionExec::new(inputs));
+
+    // Build multi-column sort expressions
+    let mut sort_exprs = Vec::with_capacity(num_value_cols);
+    for i in 0..num_value_cols {
+        let col_name = format!("col{}", i);
+        sort_exprs.push(PhysicalSortExpr {
+            expr: Arc::new(Column::new(&col_name, i)),
+            options: SortOptions {
+                descending: false,
+                nulls_first: true,
+            },
+        });
+    }
+
+    let ordering = datafusion_physical_expr::LexOrdering::new(sort_exprs).ok_or_else(|| {
+        Error::Internal {
+            message: "Failed to create LexOrdering for compound merge".to_string(),
+            location: location!(),
+        }
+    })?;
+
+    let merge_exec = Arc::new(SortPreservingMergeExec::new(ordering, union_inputs));
+
+    let unchunked = execute_plan(
+        merge_exec,
+        LanceExecutionOptions {
+            use_spilling: true,
+            ..Default::default()
+        },
+    )?;
+
+    // Chunk and process
+    let mut chunked_stream = chunk_concat_stream(unchunked, batch_size as usize);
+
+    while let Some(batch) = chunked_stream.try_next().await? {
+        // Write batch with original column names
+        let mut writer_columns: Vec<ArrayRef> = Vec::with_capacity(num_value_cols + 1);
+        for i in 0..=num_value_cols {
+            writer_columns.push(batch.column(i).clone());
+        }
+        let writer_batch = RecordBatch::try_new(arrow_schema.clone(), writer_columns)?;
+        page_file.write_record_batch(writer_batch).await?;
+
+        // Compute statistics for this batch
+        let stats = analyze_compound_batch(&batch, num_value_cols)?;
+
+        encoded_batches.push(EncodedCompoundBatch {
+            stats,
+            page_number: page_idx,
+        });
+
+        page_idx += 1;
+    }
+
+    Ok(encoded_batches)
+}
+
+/// Clean up compound partition files after successful merge.
+async fn cleanup_compound_partition_files(
+    store: &Arc<dyn IndexStore>,
+    part_lookup_files: &[String],
+    part_page_files: &[String],
+) {
+    for file_name in part_lookup_files {
+        if file_name.starts_with("part_") && file_name.ends_with("_compound_page_lookup.lance") {
+            if let Err(e) = store.delete_index_file(file_name).await {
+                log::warn!("Failed to delete partition lookup file {}: {}", file_name, e);
+            }
+        }
+    }
+
+    for file_name in part_page_files {
+        if file_name.starts_with("part_") && file_name.ends_with("_compound_page_data.lance") {
+            if let Err(e) = store.delete_index_file(file_name).await {
+                log::warn!("Failed to delete partition page file {}: {}", file_name, e);
+            }
+        }
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -2181,8 +2720,7 @@ mod tests {
         )
         .unwrap();
 
-        let column_names = vec!["tenant".to_string(), "count".to_string()];
-        let stats = analyze_compound_batch(&batch, &column_names).unwrap();
+        let stats = analyze_compound_batch(&batch, 2).unwrap();
 
         assert_eq!(stats.len(), 2);
 
@@ -2217,8 +2755,7 @@ mod tests {
         )
         .unwrap();
 
-        let column_names = vec!["tenant".to_string(), "count".to_string()];
-        let stats = analyze_compound_batch(&batch, &column_names).unwrap();
+        let stats = analyze_compound_batch(&batch, 2).unwrap();
 
         assert_eq!(stats[0].null_count, 1);
         assert_eq!(stats[1].null_count, 1);
@@ -2709,5 +3246,289 @@ mod tests {
         // IS NULL on non-first column should NOT work
         let result = parser.visit_is_null("status");
         assert!(result.is_none());
+    }
+
+    // ========================================================================
+    // Integration Tests for Update/Remap
+    // ========================================================================
+
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter as DFRecordBatchStreamAdapter;
+    use futures::stream;
+    use lance_core::cache::LanceCache;
+    use lance_core::utils::tempfile::TempObjDir;
+    use lance_io::object_store::ObjectStore;
+
+    use crate::scalar::lance_format::LanceIndexStore;
+
+    /// Helper to create a sorted test batch for compound index training.
+    fn create_sorted_test_batch(
+        tenant_ids: Vec<&str>,
+        statuses: Vec<&str>,
+        row_ids: Vec<u64>,
+    ) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("col0", DataType::Utf8, true),
+                Field::new("col1", DataType::Utf8, true),
+                Field::new(COMPOUND_IDS_COLUMN, DataType::UInt64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(tenant_ids)) as ArrayRef,
+                Arc::new(StringArray::from(statuses)) as ArrayRef,
+                Arc::new(UInt64Array::from(row_ids)) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Helper to create a stream from batches.
+    fn batches_to_stream(
+        batches: Vec<RecordBatch>,
+        schema: Arc<Schema>,
+    ) -> SendableRecordBatchStream {
+        let stream = stream::iter(batches.into_iter().map(Ok::<_, datafusion_common::DataFusionError>));
+        Box::pin(DFRecordBatchStreamAdapter::new(schema, stream))
+    }
+
+    #[tokio::test]
+    async fn test_compound_index_update_basic() {
+        // Create initial index with some data
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Initial data: tenant a-c
+        let initial_batch = create_sorted_test_batch(
+            vec!["a", "b", "c"],
+            vec!["active", "active", "inactive"],
+            vec![1, 2, 3],
+        );
+
+        let column_names = vec!["tenant".to_string(), "status".to_string()];
+        let data_types = vec![DataType::Utf8, DataType::Utf8];
+        let compound_schema = CompoundIndexSchema::new(column_names.clone(), data_types.clone()).unwrap();
+        let sub_index = CompoundFlatIndexMetadata::new(column_names.clone(), data_types.clone());
+
+        let stream = batches_to_stream(vec![initial_batch], sub_index.schema().clone());
+
+        train_compound_btree_index(
+            stream,
+            &sub_index,
+            store.as_ref(),
+            &compound_schema,
+            100,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Load the index
+        let index = CompoundBTreeIndex::load(
+            store.clone(),
+            column_names.clone(),
+            None,
+            &LanceCache::no_cache(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(index.num_pages(), 1);
+
+        // Now update with new data: tenant d-f
+        let new_batch = create_sorted_test_batch(
+            vec!["d", "e", "f"],
+            vec!["active", "inactive", "active"],
+            vec![4, 5, 6],
+        );
+
+        let new_stream = batches_to_stream(vec![new_batch], sub_index.schema().clone());
+
+        // Create a new store for the updated index
+        let update_dir = TempObjDir::default();
+        let update_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            update_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Perform the update
+        index
+            .update(new_stream, update_store.as_ref())
+            .await
+            .unwrap();
+
+        // Load the updated index
+        let updated_index = CompoundBTreeIndex::load(
+            update_store.clone(),
+            column_names.clone(),
+            None,
+            &LanceCache::no_cache(),
+        )
+        .await
+        .unwrap();
+
+        // Should still have 1 page (6 rows < batch_size)
+        assert_eq!(updated_index.num_pages(), 1);
+
+        // Verify all data is there by checking page reader
+        let page_reader = update_store.open_index_file(COMPOUND_PAGES_NAME).await.unwrap();
+        let all_data = page_reader.read_record_batch(0, 100).await.unwrap();
+        assert_eq!(all_data.num_rows(), 6);
+    }
+
+    #[tokio::test]
+    async fn test_compound_index_remap_basic() {
+        // Create index with data
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let initial_batch = create_sorted_test_batch(
+            vec!["a", "b", "c", "d"],
+            vec!["active", "active", "inactive", "active"],
+            vec![1, 2, 3, 4],
+        );
+
+        let column_names = vec!["tenant".to_string(), "status".to_string()];
+        let data_types = vec![DataType::Utf8, DataType::Utf8];
+        let compound_schema = CompoundIndexSchema::new(column_names.clone(), data_types.clone()).unwrap();
+        let sub_index = CompoundFlatIndexMetadata::new(column_names.clone(), data_types.clone());
+
+        let stream = batches_to_stream(vec![initial_batch], sub_index.schema().clone());
+
+        train_compound_btree_index(
+            stream,
+            &sub_index,
+            store.as_ref(),
+            &compound_schema,
+            100,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let index = CompoundBTreeIndex::load(
+            store.clone(),
+            column_names.clone(),
+            None,
+            &LanceCache::no_cache(),
+        )
+        .await
+        .unwrap();
+
+        // Create remap that deletes row 2 and 3
+        let mut mapping = HashMap::new();
+        mapping.insert(2u64, None);  // Delete row 2
+        mapping.insert(3u64, None);  // Delete row 3
+
+        // Create new store for remapped index
+        let remap_dir = TempObjDir::default();
+        let remap_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            remap_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Perform remap
+        index.remap(&mapping, remap_store.as_ref()).await.unwrap();
+
+        // Load remapped index and verify
+        let remapped_index = CompoundBTreeIndex::load(
+            remap_store.clone(),
+            column_names.clone(),
+            None,
+            &LanceCache::no_cache(),
+        )
+        .await
+        .unwrap();
+
+        // Page count should be same (stats are preserved)
+        assert_eq!(remapped_index.num_pages(), 1);
+
+        // Verify page data - should have 2 rows (1 and 4)
+        let page_reader = remap_store.open_index_file(COMPOUND_PAGES_NAME).await.unwrap();
+        let all_data = page_reader.read_record_batch(0, 100).await.unwrap();
+        assert_eq!(all_data.num_rows(), 2);
+
+        // Verify row IDs
+        let row_ids = all_data
+            .column_by_name(COMPOUND_IDS_COLUMN)
+            .unwrap()
+            .as_primitive::<arrow_array::types::UInt64Type>();
+        assert_eq!(row_ids.value(0), 1);
+        assert_eq!(row_ids.value(1), 4);
+    }
+
+    #[tokio::test]
+    async fn test_compound_index_remap_no_op() {
+        // Test that empty/no-op remap produces identical results
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let initial_batch = create_sorted_test_batch(
+            vec!["a", "b", "c"],
+            vec!["x", "y", "z"],
+            vec![10, 20, 30],
+        );
+
+        let column_names = vec!["col1".to_string(), "col2".to_string()];
+        let data_types = vec![DataType::Utf8, DataType::Utf8];
+        let compound_schema = CompoundIndexSchema::new(column_names.clone(), data_types.clone()).unwrap();
+        let sub_index = CompoundFlatIndexMetadata::new(column_names.clone(), data_types.clone());
+
+        let stream = batches_to_stream(vec![initial_batch], sub_index.schema().clone());
+
+        train_compound_btree_index(
+            stream,
+            &sub_index,
+            store.as_ref(),
+            &compound_schema,
+            100,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let index = CompoundBTreeIndex::load(
+            store.clone(),
+            column_names.clone(),
+            None,
+            &LanceCache::no_cache(),
+        )
+        .await
+        .unwrap();
+
+        // Empty mapping = no-op
+        let mapping = HashMap::new();
+
+        let remap_dir = TempObjDir::default();
+        let remap_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            remap_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        index.remap(&mapping, remap_store.as_ref()).await.unwrap();
+
+        // Verify data is identical
+        let original_reader = store.open_index_file(COMPOUND_PAGES_NAME).await.unwrap();
+        let remapped_reader = remap_store.open_index_file(COMPOUND_PAGES_NAME).await.unwrap();
+
+        assert_eq!(original_reader.num_rows(), remapped_reader.num_rows());
+
+        let original_data = original_reader.read_record_batch(0, 100).await.unwrap();
+        let remapped_data = remapped_reader.read_record_batch(0, 100).await.unwrap();
+
+        assert_eq!(original_data, remapped_data);
     }
 }
