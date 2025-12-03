@@ -960,4 +960,237 @@ mod tests {
             err
         );
     }
+
+    /// Test compound index search with multiple key combinations (cartesian product).
+    ///
+    /// This test mirrors the failing catalyzed-lance test to isolate whether the
+    /// bug is in Lance's compound index implementation or in catalyzed-lance's usage.
+    #[tokio::test]
+    async fn test_compound_index_search_cartesian_product() {
+        use lance_index::scalar::compound::CompoundSargableQuery;
+        use lance_index::scalar::{ScalarIndex, ScalarIndexParams};
+        use lance_index::metrics::NoOpMetricsCollector;
+        use lance_index::DatasetIndexExt;
+        use datafusion::common::ScalarValue;
+
+        // Create temporary directory for dataset
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        // Create test data matching catalyzed-lance's test:
+        // | tenant_id | status   | value |
+        // |-----------|----------|-------|
+        // | acme      | active   | 100   |
+        // | acme      | active   | 200   |
+        // | acme      | inactive | 300   |
+        // | beta      | active   | 400   |
+        // | beta      | inactive | 500   |
+        // | gamma     | active   | 600   |
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("tenant_id", DataType::Utf8, false),
+            ArrowField::new("status", DataType::Utf8, false),
+            ArrowField::new("value", DataType::Int32, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "acme", "acme", "acme", "beta", "beta", "gamma",
+                ])),
+                Arc::new(StringArray::from(vec![
+                    "active", "active", "inactive", "active", "inactive", "active",
+                ])),
+                Arc::new(Int32Array::from(vec![100, 200, 300, 400, 500, 600])),
+            ],
+        )
+        .unwrap();
+
+        // Write dataset
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(batches, &dataset_uri, None).await.unwrap();
+
+        // Create compound index on tenant_id and status
+        let params = ScalarIndexParams::default();
+        dataset
+            .create_index(
+                &["tenant_id", "status"],
+                IndexType::BTree,
+                Some("idx_tenant_status".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Open the compound index
+        let indices = dataset.load_indices().await.unwrap();
+        let compound_idx = &indices[0];
+        let scalar_index = dataset
+            .open_scalar_index(
+                "tenant_id",
+                &compound_idx.uuid.to_string(),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+
+        // Test each key combination individually to verify the index returns correct results
+
+        // First, let's see what the index actually contains
+        println!("Testing compound index search...");
+
+        // Test prefix-only query: just tenant_id = 'acme' - should return 3 rows
+        let query_prefix_only = CompoundSargableQuery::PrefixLookup {
+            prefix: vec![ScalarValue::Utf8(Some("acme".to_string()))],
+            range: None,
+        };
+        let result_prefix = scalar_index
+            .search(&query_prefix_only, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let row_ids_prefix: Vec<u64> = result_prefix
+            .row_addrs()
+            .row_addrs()
+            .map(|iter| iter.map(u64::from).collect())
+            .unwrap_or_default();
+        println!("Query (acme only): {:?} - expected 3 rows", row_ids_prefix);
+
+        // Test 1: (acme, active) - should return 2 rows
+        let query1 = CompoundSargableQuery::PrefixLookup {
+            prefix: vec![
+                ScalarValue::Utf8(Some("acme".to_string())),
+                ScalarValue::Utf8(Some("active".to_string())),
+            ],
+            range: None,
+        };
+        let result1 = scalar_index.search(&query1, &NoOpMetricsCollector).await.unwrap();
+        let row_ids1: Vec<u64> = result1
+            .row_addrs()
+            .row_addrs()
+            .map(|iter| iter.map(u64::from).collect())
+            .unwrap_or_default();
+        println!("Query (acme, active): {:?}", row_ids1);
+        assert_eq!(
+            row_ids1.len(),
+            2,
+            "(acme, active) should return 2 rows, got {:?}",
+            row_ids1
+        );
+
+        // Let's see what row 2 (acme, inactive, 300) looks like in the dataset
+        let row2_projection = crate::dataset::ProjectionRequest::from_columns(
+            ["tenant_id", "status", "value"],
+            dataset.schema(),
+        );
+        let row2_data = dataset.take_rows(&[2], row2_projection).await.unwrap();
+        println!("Row 2 data: tenant_id={:?}, status={:?}, value={:?}",
+            row2_data.column_by_name("tenant_id").unwrap(),
+            row2_data.column_by_name("status").unwrap(),
+            row2_data.column_by_name("value").unwrap(),
+        );
+
+        // Test 2: (acme, inactive) - should return 1 row
+        let query2 = CompoundSargableQuery::PrefixLookup {
+            prefix: vec![
+                ScalarValue::Utf8(Some("acme".to_string())),
+                ScalarValue::Utf8(Some("inactive".to_string())),
+            ],
+            range: None,
+        };
+        let result2 = scalar_index.search(&query2, &NoOpMetricsCollector).await.unwrap();
+        let row_ids2: Vec<u64> = result2
+            .row_addrs()
+            .row_addrs()
+            .map(|iter| iter.map(u64::from).collect())
+            .unwrap_or_default();
+        println!("Query (acme, inactive): {:?}", row_ids2);
+        assert_eq!(
+            row_ids2.len(),
+            1,
+            "(acme, inactive) should return 1 row, got {:?}",
+            row_ids2
+        );
+
+        // Test 3: (beta, active) - should return 1 row
+        let query3 = CompoundSargableQuery::PrefixLookup {
+            prefix: vec![
+                ScalarValue::Utf8(Some("beta".to_string())),
+                ScalarValue::Utf8(Some("active".to_string())),
+            ],
+            range: None,
+        };
+        let result3 = scalar_index.search(&query3, &NoOpMetricsCollector).await.unwrap();
+        let row_ids3: Vec<u64> = result3
+            .row_addrs()
+            .row_addrs()
+            .map(|iter| iter.map(u64::from).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            row_ids3.len(),
+            1,
+            "(beta, active) should return 1 row, got {:?}",
+            row_ids3
+        );
+
+        // Test 4: (beta, inactive) - should return 1 row
+        let query4 = CompoundSargableQuery::PrefixLookup {
+            prefix: vec![
+                ScalarValue::Utf8(Some("beta".to_string())),
+                ScalarValue::Utf8(Some("inactive".to_string())),
+            ],
+            range: None,
+        };
+        let result4 = scalar_index.search(&query4, &NoOpMetricsCollector).await.unwrap();
+        let row_ids4: Vec<u64> = result4
+            .row_addrs()
+            .row_addrs()
+            .map(|iter| iter.map(u64::from).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            row_ids4.len(),
+            1,
+            "(beta, inactive) should return 1 row, got {:?}",
+            row_ids4
+        );
+
+        // Verify total: 2 + 1 + 1 + 1 = 5 unique rows
+        let mut all_row_ids: Vec<u64> = vec![];
+        all_row_ids.extend(&row_ids1);
+        all_row_ids.extend(&row_ids2);
+        all_row_ids.extend(&row_ids3);
+        all_row_ids.extend(&row_ids4);
+        all_row_ids.sort();
+        all_row_ids.dedup();
+        assert_eq!(
+            all_row_ids.len(),
+            5,
+            "Total unique rows should be 5, got {:?}",
+            all_row_ids
+        );
+
+        // Fetch the actual rows to verify values
+        let projection = crate::dataset::ProjectionRequest::from_columns(
+            ["tenant_id", "status", "value"],
+            dataset.schema(),
+        );
+        let fetched = dataset.take_rows(&all_row_ids, projection).await.unwrap();
+        assert_eq!(fetched.num_rows(), 5);
+
+        // Verify the values are correct (100, 200, 300, 400, 500)
+        let value_col = fetched
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let mut values: Vec<i32> = (0..value_col.len()).map(|i| value_col.value(i)).collect();
+        values.sort();
+        assert_eq!(
+            values,
+            vec![100, 200, 300, 400, 500],
+            "Values should be [100, 200, 300, 400, 500], got {:?}",
+            values
+        );
+    }
 }

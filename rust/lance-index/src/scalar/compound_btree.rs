@@ -717,16 +717,10 @@ fn analyze_compound_batch(batch: &RecordBatch, num_value_columns: usize) -> Resu
     for i in 0..num_value_columns {
         let col = batch.column(i);
 
-        // For sorted data: min is first row, max is last row
-        let min = ScalarValue::try_from_array(col, 0).map_err(|e| Error::Internal {
-            message: format!("Failed to get min value for column {}: {}", i, e),
-            location: location!(),
-        })?;
-
-        let max = ScalarValue::try_from_array(col, col.len() - 1).map_err(|e| Error::Internal {
-            message: format!("Failed to get max value for column {}: {}", i, e),
-            location: location!(),
-        })?;
+        // Compute true min/max across all rows in the column.
+        // We cannot assume secondary columns are sorted - only the compound key
+        // (all columns together) is sorted, not individual columns.
+        let (min, max) = compute_column_min_max(col, i)?;
 
         stats.push(ColumnStats {
             min,
@@ -736,6 +730,64 @@ fn analyze_compound_batch(batch: &RecordBatch, num_value_columns: usize) -> Resu
     }
 
     Ok(stats)
+}
+
+/// Compute true min and max values for a column by scanning all rows.
+fn compute_column_min_max(col: &ArrayRef, col_idx: usize) -> Result<(ScalarValue, ScalarValue)> {
+    use std::cmp::Ordering;
+
+    let len = col.len();
+    if len == 0 {
+        return Err(Error::Internal {
+            message: format!("Empty column {} in compound btree training", col_idx),
+            location: location!(),
+        });
+    }
+
+    // Find first non-null value to initialize min/max
+    let mut min_idx: Option<usize> = None;
+    for i in 0..len {
+        if !col.is_null(i) {
+            min_idx = Some(i);
+            break;
+        }
+    }
+
+    // If all values are null, return null for both min and max
+    let Some(first_valid_idx) = min_idx else {
+        let null_val = ScalarValue::try_from_array(col, 0).map_err(|e| Error::Internal {
+            message: format!("Failed to get null value for column {}: {}", col_idx, e),
+            location: location!(),
+        })?;
+        return Ok((null_val.clone(), null_val));
+    };
+
+    let mut min = ScalarValue::try_from_array(col, first_valid_idx).map_err(|e| Error::Internal {
+        message: format!("Failed to get initial min value for column {}: {}", col_idx, e),
+        location: location!(),
+    })?;
+    let mut max = min.clone();
+
+    // Scan remaining rows to find true min/max
+    for i in (first_valid_idx + 1)..len {
+        if col.is_null(i) {
+            continue;
+        }
+
+        let val = ScalarValue::try_from_array(col, i).map_err(|e| Error::Internal {
+            message: format!("Failed to get value at row {} for column {}: {}", i, col_idx, e),
+            location: location!(),
+        })?;
+
+        if let Some(Ordering::Less) = val.partial_cmp(&min) {
+            min = val.clone();
+        }
+        if let Some(Ordering::Greater) = val.partial_cmp(&max) {
+            max = val;
+        }
+    }
+
+    Ok((min, max))
 }
 
 /// Encoded batch result from training a single page.
@@ -2652,7 +2704,7 @@ async fn cleanup_compound_partition_files(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int64Array, StringArray};
+    use arrow_array::{Int32Array, Int64Array, StringArray};
     use std::sync::Arc;
 
     #[test]
@@ -2759,6 +2811,135 @@ mod tests {
 
         assert_eq!(stats[0].null_count, 1);
         assert_eq!(stats[1].null_count, 1);
+    }
+
+    /// Test that secondary column statistics are computed correctly when data
+    /// is sorted by compound key but secondary columns are not monotonic.
+    ///
+    /// This is a regression test for a bug where we assumed first/last row
+    /// contained min/max for all columns, but that's only true for the primary
+    /// sort key. Secondary columns can have any ordering within groups.
+    #[test]
+    fn test_analyze_compound_batch_secondary_column_non_monotonic() {
+        // Data sorted by (tenant_id, status) compound key:
+        // Row 0: (acme, active)   <- tenant_id min = "acme"
+        // Row 1: (acme, active)
+        // Row 2: (acme, inactive) <- status has "inactive" here
+        // Row 3: (beta, active)
+        // Row 4: (beta, inactive) <- status has "inactive" here
+        // Row 5: (gamma, active)  <- tenant_id max = "gamma", status = "active"
+        //
+        // For status column: first="active", last="active", but true max="inactive"
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("tenant_id", DataType::Utf8, false),
+                Field::new("status", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "acme", "acme", "acme", "beta", "beta", "gamma",
+                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec![
+                    "active", "active", "inactive", "active", "inactive", "active",
+                ])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let stats = analyze_compound_batch(&batch, 2).unwrap();
+
+        assert_eq!(stats.len(), 2);
+
+        // First column: tenant_id - sorted, so min="acme", max="gamma"
+        assert_eq!(
+            stats[0].min,
+            ScalarValue::Utf8(Some("acme".to_string()))
+        );
+        assert_eq!(
+            stats[0].max,
+            ScalarValue::Utf8(Some("gamma".to_string()))
+        );
+
+        // Second column: status - NOT sorted, must scan all rows
+        // "active" < "inactive" lexicographically, so min="active", max="inactive"
+        assert_eq!(
+            stats[1].min,
+            ScalarValue::Utf8(Some("active".to_string())),
+            "status min should be 'active'"
+        );
+        assert_eq!(
+            stats[1].max,
+            ScalarValue::Utf8(Some("inactive".to_string())),
+            "status max should be 'inactive' (found in middle of sorted data)"
+        );
+    }
+
+    /// Test statistics with integer secondary columns that are non-monotonic.
+    #[test]
+    fn test_analyze_compound_batch_integer_secondary_non_monotonic() {
+        // Data sorted by (category, value) but value column resets within each category
+        // Row 0: (A, 50)
+        // Row 1: (A, 100)  <- value max within A
+        // Row 2: (B, 10)   <- value min overall
+        // Row 3: (B, 200)  <- value max overall
+        // Row 4: (C, 30)
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("category", DataType::Utf8, false),
+                Field::new("value", DataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["A", "A", "B", "B", "C"])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![50, 100, 10, 200, 30])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let stats = analyze_compound_batch(&batch, 2).unwrap();
+
+        // First column: category
+        assert_eq!(stats[0].min, ScalarValue::Utf8(Some("A".to_string())));
+        assert_eq!(stats[0].max, ScalarValue::Utf8(Some("C".to_string())));
+
+        // Second column: value - must find true min=10, max=200
+        assert_eq!(
+            stats[1].min,
+            ScalarValue::Int32(Some(10)),
+            "value min should be 10 (from row 2)"
+        );
+        assert_eq!(
+            stats[1].max,
+            ScalarValue::Int32(Some(200)),
+            "value max should be 200 (from row 3)"
+        );
+    }
+
+    /// Test that all-null columns are handled correctly.
+    #[test]
+    fn test_analyze_compound_batch_all_null_column() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("tenant", DataType::Utf8, true),
+                Field::new("nullable_col", DataType::Int64, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![None, None, None])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let stats = analyze_compound_batch(&batch, 2).unwrap();
+
+        // First column: normal
+        assert_eq!(stats[0].min, ScalarValue::Utf8(Some("a".to_string())));
+        assert_eq!(stats[0].max, ScalarValue::Utf8(Some("c".to_string())));
+        assert_eq!(stats[0].null_count, 0);
+
+        // Second column: all nulls - min and max should both be null
+        assert!(stats[1].min.is_null(), "min should be null for all-null column");
+        assert!(stats[1].max.is_null(), "max should be null for all-null column");
+        assert_eq!(stats[1].null_count, 3);
     }
 
     #[test]
