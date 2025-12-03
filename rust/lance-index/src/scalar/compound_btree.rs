@@ -990,15 +990,692 @@ pub fn create_compound_row_converter(data_types: &[DataType]) -> Result<RowConve
 }
 
 // ============================================================================
-// Plugin Implementation
+// CompoundBTreeIndex - Main Index Structure
 // ============================================================================
 
 use crate::frag_reuse::FragReuseIndex;
+use crate::metrics::{MetricsCollector, NoOpMetricsCollector};
 use crate::pb;
 use crate::scalar::expression::ScalarQueryParser;
 use crate::scalar::registry::{ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest};
-use crate::scalar::CreatedIndex;
-use lance_core::cache::LanceCache;
+use crate::scalar::{AnyQuery, CreatedIndex, IndexReader, SearchResult, UpdateCriteria};
+use crate::Index;
+use futures::stream::{self, StreamExt};
+use lance_core::cache::{LanceCache, WeakLanceCache};
+use lance_core::utils::mask::RowAddrTreeMap;
+use roaring::RoaringBitmap;
+use std::any::Any;
+use tracing::debug;
+
+use super::compound::CompoundSargableQuery;
+
+/// Lazy index reader for compound index pages.
+/// 
+/// Only opens the file reader if/when needed (e.g., if pages aren't cached).
+#[derive(Clone)]
+struct LazyCompoundIndexReader {
+    index_reader: Arc<tokio::sync::Mutex<Option<Arc<dyn IndexReader>>>>,
+    store: Arc<dyn IndexStore>,
+}
+
+impl LazyCompoundIndexReader {
+    fn new(store: Arc<dyn IndexStore>) -> Self {
+        Self {
+            index_reader: Arc::new(tokio::sync::Mutex::new(None)),
+            store,
+        }
+    }
+
+    async fn get(&self) -> Result<Arc<dyn IndexReader>> {
+        let mut reader = self.index_reader.lock().await;
+        if reader.is_none() {
+            let index_reader = self.store.open_index_file(COMPOUND_PAGES_NAME).await?;
+            *reader = Some(index_reader);
+        }
+        Ok(reader.as_ref().unwrap().clone())
+    }
+}
+
+/// Cache key for compound index pages.
+#[derive(Debug, Clone)]
+pub struct CompoundBTreePageKey {
+    pub page_number: u32,
+}
+
+impl lance_core::cache::CacheKey for CompoundBTreePageKey {
+    type ValueType = CachedCompoundPage;
+
+    fn key(&self) -> std::borrow::Cow<'_, str> {
+        format!("compound-page-{}", self.page_number).into()
+    }
+}
+
+/// Cached compound index page data.
+#[derive(Debug, Clone)]
+pub struct CachedCompoundPage(RecordBatch);
+
+impl DeepSizeOf for CachedCompoundPage {
+    fn deep_size_of_children(&self, _context: &mut deepsize::Context) -> usize {
+        // Approximate size based on batch
+        self.0.num_rows() * self.0.num_columns() * 8
+    }
+}
+
+impl CachedCompoundPage {
+    pub fn new(batch: RecordBatch) -> Self {
+        Self(batch)
+    }
+
+    pub fn into_inner(self) -> RecordBatch {
+        self.0
+    }
+
+    pub fn batch(&self) -> &RecordBatch {
+        &self.0
+    }
+}
+
+/// Compound B-tree index for multi-column queries.
+///
+/// This index enables efficient lookups on predicates like:
+/// - `WHERE tenant_id = 'acme' AND status = 'active'` (prefix lookup)
+/// - `WHERE tenant_id = 'acme' AND timestamp > '2024-01-01'` (prefix + range)
+/// - `WHERE tenant_id = 'acme'` (partial prefix)
+///
+/// # Architecture
+///
+/// Similar to single-column BTreeIndex but with:
+/// - Multiple value columns per page
+/// - Per-column min/max/null_count statistics for pruning
+/// - Arrow Row Format for compound key comparison
+#[derive(Clone, Debug)]
+pub struct CompoundBTreeIndex {
+    /// Column names in index order.
+    columns: Vec<String>,
+    /// Column data types.
+    data_types: Vec<DataType>,
+    /// Page lookup structure with per-column statistics.
+    page_lookup: Arc<CompoundBTreeLookup>,
+    /// Cache for loaded pages.
+    index_cache: WeakLanceCache,
+    /// Storage backend.
+    store: Arc<dyn IndexStore>,
+    /// Subindex metadata for loading pages.
+    sub_index: Arc<dyn CompoundBTreeSubIndex>,
+    /// Rows per page.
+    batch_size: u64,
+    /// Fragment reuse index for row ID remapping.
+    frag_reuse_index: Option<Arc<FragReuseIndex>>,
+}
+
+impl DeepSizeOf for CompoundBTreeIndex {
+    fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
+        self.page_lookup.deep_size_of_children(context)
+            + self.store.deep_size_of_children(context)
+    }
+}
+
+impl CompoundBTreeIndex {
+    /// Load a compound index from storage.
+    ///
+    /// # Arguments
+    ///
+    /// * `store` - Storage backend containing index files
+    /// * `column_names` - Column names in index order
+    /// * `frag_reuse_index` - Optional fragment reuse index for row ID remapping
+    /// * `index_cache` - Cache for loaded pages
+    pub async fn load(
+        store: Arc<dyn IndexStore>,
+        column_names: Vec<String>,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        index_cache: &LanceCache,
+    ) -> Result<Arc<Self>> {
+        // Load the lookup file
+        let page_lookup_file = store.open_index_file(COMPOUND_LOOKUP_NAME).await?;
+        let num_rows = page_lookup_file.num_rows();
+        let serialized_lookup = page_lookup_file.read_range(0..num_rows, None).await?;
+
+        // Extract batch size from schema metadata
+        let file_schema = page_lookup_file.schema();
+        let batch_size = file_schema
+            .metadata
+            .get(COMPOUND_BATCH_SIZE_META_KEY)
+            .map(|bs| bs.parse().unwrap_or(DEFAULT_COMPOUND_BATCH_SIZE))
+            .unwrap_or(DEFAULT_COMPOUND_BATCH_SIZE);
+
+        // Build the lookup structure (extracts data types from schema)
+        let page_lookup = CompoundBTreeLookup::try_from_serialized(serialized_lookup, &column_names)?;
+        let data_types = page_lookup.data_types().to_vec();
+
+        // Create sub_index metadata
+        let sub_index = Arc::new(CompoundFlatIndexMetadata::new(
+            column_names.clone(),
+            data_types.clone(),
+        ));
+
+        Ok(Arc::new(Self {
+            columns: column_names,
+            data_types,
+            page_lookup: Arc::new(page_lookup),
+            index_cache: WeakLanceCache::from(index_cache),
+            store,
+            sub_index,
+            batch_size,
+            frag_reuse_index,
+        }))
+    }
+
+    /// Get the column names in this index.
+    pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+
+    /// Get the data types for indexed columns.
+    pub fn data_types(&self) -> &[DataType] {
+        &self.data_types
+    }
+
+    /// Get the number of pages in this index.
+    pub fn num_pages(&self) -> usize {
+        self.page_lookup.num_pages()
+    }
+
+    /// Look up a page, using cache if available.
+    async fn lookup_page(
+        &self,
+        page_number: u32,
+        index_reader: LazyCompoundIndexReader,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
+        self.index_cache
+            .get_or_insert_with_key(CompoundBTreePageKey { page_number }, move || async move {
+                let result = self.read_page(page_number, index_reader, metrics).await?;
+                Ok(CachedCompoundPage::new(result))
+            })
+            .await
+            .map(|v| v.as_ref().clone().into_inner())
+    }
+
+    /// Read a page from storage.
+    async fn read_page(
+        &self,
+        page_number: u32,
+        index_reader: LazyCompoundIndexReader,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RecordBatch> {
+        metrics.record_part_load();
+        let reader = index_reader.get().await?;
+        let mut batch = reader
+            .read_record_batch(page_number as u64, self.batch_size)
+            .await?;
+
+        // Apply fragment reuse remapping if present
+        if let Some(fri) = &self.frag_reuse_index {
+            batch = fri.remap_row_ids_record_batch(batch, self.columns.len())?;
+        }
+
+        Ok(batch)
+    }
+
+    /// Search a single page for matching rows.
+    async fn search_page(
+        &self,
+        query: &CompoundSargableQuery,
+        page_number: u32,
+        index_reader: LazyCompoundIndexReader,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<RowAddrTreeMap> {
+        let page_batch = self.lookup_page(page_number, index_reader, metrics).await?;
+        self.search_batch(&page_batch, query)
+    }
+
+    /// Search a batch for rows matching the query.
+    fn search_batch(
+        &self,
+        batch: &RecordBatch,
+        query: &CompoundSargableQuery,
+    ) -> Result<RowAddrTreeMap> {
+        match query {
+            CompoundSargableQuery::FullKeyLookup(key) => {
+                self.search_full_key(batch, key)
+            }
+            CompoundSargableQuery::PrefixLookup { prefix, range } => {
+                self.search_prefix(batch, prefix, range.as_ref())
+            }
+            CompoundSargableQuery::Range { lower, upper } => {
+                self.search_range(batch, lower, upper)
+            }
+        }
+    }
+
+    /// Search for an exact full key match.
+    fn search_full_key(
+        &self,
+        batch: &RecordBatch,
+        key: &super::compound::CompoundKey,
+    ) -> Result<RowAddrTreeMap> {
+        // Create row converter for comparison
+        let converter = create_compound_row_converter(&self.data_types)?;
+
+        // Convert page columns to rows
+        let value_cols: Vec<ArrayRef> = self.columns
+            .iter()
+            .map(|name| batch.column_by_name(name).cloned())
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| Error::Index {
+                message: "Missing value columns in page".to_string(),
+                location: location!(),
+            })?;
+
+        let page_rows = converter.convert_columns(&value_cols).map_err(|e| Error::Index {
+            message: format!("Failed to convert page to rows: {}", e),
+            location: location!(),
+        })?;
+
+        // Binary search for the key
+        let key_bytes = key.as_bytes();
+        let mut results = RowAddrTreeMap::new();
+
+        // Find matching rows
+        let row_ids = batch
+            .column_by_name(COMPOUND_IDS_COLUMN)
+            .ok_or_else(|| Error::Index {
+                message: "Missing _rowid column in page".to_string(),
+                location: location!(),
+            })?
+            .as_primitive::<UInt64Type>();
+
+        for idx in 0..page_rows.num_rows() {
+            let row = page_rows.row(idx);
+            if row.as_ref() == key_bytes {
+                results.insert(row_ids.value(idx));
+            } else if row.as_ref() > key_bytes {
+                // Since data is sorted, we can stop early
+                break;
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Search for rows matching a prefix (with optional range on next column).
+    fn search_prefix(
+        &self,
+        batch: &RecordBatch,
+        prefix: &[ScalarValue],
+        range: Option<&(std::ops::Bound<ScalarValue>, std::ops::Bound<ScalarValue>)>,
+    ) -> Result<RowAddrTreeMap> {
+        let mut results = RowAddrTreeMap::new();
+
+        // Get row IDs column
+        let row_ids = batch
+            .column_by_name(COMPOUND_IDS_COLUMN)
+            .ok_or_else(|| Error::Index {
+                message: "Missing _rowid column in page".to_string(),
+                location: location!(),
+            })?
+            .as_primitive::<UInt64Type>();
+
+        // Check each row against prefix predicates
+        for row_idx in 0..batch.num_rows() {
+            let mut matches = true;
+
+            // Check prefix columns for equality
+            for (col_idx, expected_value) in prefix.iter().enumerate() {
+                let col = batch.column_by_name(&self.columns[col_idx]).ok_or_else(|| {
+                    Error::Index {
+                        message: format!("Missing column {} in page", self.columns[col_idx]),
+                        location: location!(),
+                    }
+                })?;
+
+                let actual_value = ScalarValue::try_from_array(col, row_idx).map_err(|e| {
+                    Error::Index {
+                        message: format!("Failed to get value at row {}: {}", row_idx, e),
+                        location: location!(),
+                    }
+                })?;
+
+                if actual_value != *expected_value {
+                    matches = false;
+                    break;
+                }
+            }
+
+            // Check range on next column if present and prefix matched
+            if matches {
+                if let Some((lower, upper)) = range {
+                    let range_col_idx = prefix.len();
+                    if range_col_idx < self.columns.len() {
+                        matches = self.matches_range(batch, row_idx, range_col_idx, lower, upper)?;
+                    }
+                }
+            }
+
+            if matches {
+                results.insert(row_ids.value(row_idx));
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Check if a row matches a range predicate.
+    fn matches_range(
+        &self,
+        batch: &RecordBatch,
+        row_idx: usize,
+        col_idx: usize,
+        lower: &std::ops::Bound<ScalarValue>,
+        upper: &std::ops::Bound<ScalarValue>,
+    ) -> Result<bool> {
+        use std::ops::Bound;
+
+        let col = batch.column_by_name(&self.columns[col_idx]).ok_or_else(|| Error::Index {
+            message: format!("Missing column {} in page", self.columns[col_idx]),
+            location: location!(),
+        })?;
+
+        let value = ScalarValue::try_from_array(col, row_idx).map_err(|e| Error::Index {
+            message: format!("Failed to get value at row {}: {}", row_idx, e),
+            location: location!(),
+        })?;
+
+        // NULL doesn't match any range
+        if value.is_null() {
+            return Ok(false);
+        }
+
+        let lower_ok = match lower {
+            Bound::Unbounded => true,
+            Bound::Included(v) => {
+                value.partial_cmp(v).map_or(false, |o| o != std::cmp::Ordering::Less)
+            }
+            Bound::Excluded(v) => {
+                value.partial_cmp(v).map_or(false, |o| o == std::cmp::Ordering::Greater)
+            }
+        };
+
+        let upper_ok = match upper {
+            Bound::Unbounded => true,
+            Bound::Included(v) => {
+                value.partial_cmp(v).map_or(false, |o| o != std::cmp::Ordering::Greater)
+            }
+            Bound::Excluded(v) => {
+                value.partial_cmp(v).map_or(false, |o| o == std::cmp::Ordering::Less)
+            }
+        };
+
+        Ok(lower_ok && upper_ok)
+    }
+
+    /// Search for rows within a compound key range.
+    fn search_range(
+        &self,
+        batch: &RecordBatch,
+        lower: &std::ops::Bound<super::compound::CompoundKey>,
+        upper: &std::ops::Bound<super::compound::CompoundKey>,
+    ) -> Result<RowAddrTreeMap> {
+        use std::ops::Bound;
+
+        // Create row converter for comparison
+        let converter = create_compound_row_converter(&self.data_types)?;
+
+        // Convert page columns to rows
+        let value_cols: Vec<ArrayRef> = self.columns
+            .iter()
+            .map(|name| batch.column_by_name(name).cloned())
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| Error::Index {
+                message: "Missing value columns in page".to_string(),
+                location: location!(),
+            })?;
+
+        let page_rows = converter.convert_columns(&value_cols).map_err(|e| Error::Index {
+            message: format!("Failed to convert page to rows: {}", e),
+            location: location!(),
+        })?;
+
+        let row_ids = batch
+            .column_by_name(COMPOUND_IDS_COLUMN)
+            .ok_or_else(|| Error::Index {
+                message: "Missing _rowid column in page".to_string(),
+                location: location!(),
+            })?
+            .as_primitive::<UInt64Type>();
+
+        let mut results = RowAddrTreeMap::new();
+
+        for idx in 0..page_rows.num_rows() {
+            let row = page_rows.row(idx);
+            let row_bytes = row.as_ref();
+
+            let lower_ok = match lower {
+                Bound::Unbounded => true,
+                Bound::Included(k) => row_bytes >= k.as_bytes(),
+                Bound::Excluded(k) => row_bytes > k.as_bytes(),
+            };
+
+            let upper_ok = match upper {
+                Bound::Unbounded => true,
+                Bound::Included(k) => row_bytes <= k.as_bytes(),
+                Bound::Excluded(k) => row_bytes < k.as_bytes(),
+            };
+
+            if lower_ok && upper_ok {
+                results.insert(row_ids.value(idx));
+            }
+        }
+
+        Ok(results)
+    }
+}
+
+// Implement Index trait for CompoundBTreeIndex
+#[async_trait]
+impl Index for CompoundBTreeIndex {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
+        self
+    }
+
+    fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
+        Err(Error::NotSupported {
+            source: "CompoundBTreeIndex is not a vector index".into(),
+            location: location!(),
+        })
+    }
+
+    async fn prewarm(&self) -> Result<()> {
+        let index_reader = LazyCompoundIndexReader::new(self.store.clone());
+        let reader = index_reader.get().await?;
+        let num_rows = reader.num_rows();
+        let batch_size = self.batch_size as usize;
+        let num_pages = num_rows.div_ceil(batch_size);
+
+        for page_idx in 0..num_pages {
+            let page = self
+                .read_page(page_idx as u32, index_reader.clone(), &NoOpMetricsCollector)
+                .await?;
+            let inserted = self
+                .index_cache
+                .insert_with_key(
+                    &CompoundBTreePageKey {
+                        page_number: page_idx as u32,
+                    },
+                    Arc::new(CachedCompoundPage::new(page)),
+                )
+                .await;
+
+            if !inserted {
+                return Err(Error::Internal {
+                    message: "Failed to prewarm index: cache is no longer available".to_string(),
+                    location: location!(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    fn index_type(&self) -> crate::IndexType {
+        crate::IndexType::Scalar
+    }
+
+    fn statistics(&self) -> Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "type": "CompoundBTree",
+            "columns": self.columns,
+            "num_pages": self.page_lookup.num_pages(),
+        }))
+    }
+
+    async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
+        let mut frag_ids = RoaringBitmap::default();
+
+        let page_reader = self.store.open_index_file(COMPOUND_PAGES_NAME).await?;
+        let num_batches = page_reader.num_batches(self.batch_size).await;
+
+        for page_idx in 0..num_batches {
+            let batch = page_reader
+                .read_record_batch(page_idx as u64, self.batch_size)
+                .await?;
+
+            let row_ids = batch
+                .column_by_name(COMPOUND_IDS_COLUMN)
+                .ok_or_else(|| Error::Index {
+                    message: "Missing _rowid column".to_string(),
+                    location: location!(),
+                })?
+                .as_primitive::<UInt64Type>();
+
+            for i in 0..row_ids.len() {
+                let row_id = row_ids.value(i);
+                let frag_id = (row_id >> 32) as u32;
+                frag_ids.insert(frag_id);
+            }
+        }
+
+        Ok(frag_ids)
+    }
+}
+
+// Implement ScalarIndex trait for CompoundBTreeIndex
+#[async_trait]
+impl ScalarIndex for CompoundBTreeIndex {
+    async fn search(
+        &self,
+        query: &dyn AnyQuery,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
+        let query = query
+            .as_any()
+            .downcast_ref::<CompoundSargableQuery>()
+            .ok_or_else(|| Error::Index {
+                message: "CompoundBTreeIndex expects CompoundSargableQuery".to_string(),
+                location: location!(),
+            })?;
+
+        // Find candidate pages using per-column statistics pruning
+        let pages = self.page_lookup.find_candidate_pages(query);
+
+        debug!("Searching {} compound btree pages", pages.len());
+
+        // Search each candidate page in parallel
+        let lazy_reader = LazyCompoundIndexReader::new(self.store.clone());
+        let page_tasks: Vec<_> = pages
+            .into_iter()
+            .map(|page_idx| {
+                let reader = lazy_reader.clone();
+                async move { self.search_page(query, page_idx, reader, metrics).await }
+            })
+            .collect();
+
+        // Collect results
+        let row_ids = stream::iter(page_tasks)
+            .buffered(self.store.io_parallelism())
+            .try_collect::<RowAddrTreeMap>()
+            .await?;
+
+        Ok(SearchResult::Exact(row_ids))
+    }
+
+    fn can_remap(&self) -> bool {
+        true
+    }
+
+    async fn remap(
+        &self,
+        mapping: &HashMap<u64, Option<u64>>,
+        dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        // Remap and write pages
+        let mut page_file = dest_store
+            .new_index_file(COMPOUND_PAGES_NAME, self.sub_index.schema().clone())
+            .await?;
+
+        let page_reader = self.store.open_index_file(COMPOUND_PAGES_NAME).await?;
+        let num_batches = page_reader.num_batches(self.batch_size).await;
+
+        for page_idx in 0..num_batches {
+            let batch = page_reader
+                .read_record_batch(page_idx as u64, self.batch_size)
+                .await?;
+            let remapped = self.sub_index.remap_subindex(batch, mapping).await?;
+            page_file.write_record_batch(remapped).await?;
+        }
+
+        page_file.finish().await?;
+
+        // Copy lookup file as-is
+        self.store
+            .copy_index_file(COMPOUND_LOOKUP_NAME, dest_store)
+            .await?;
+
+        Ok(CreatedIndex {
+            index_details: prost_types::Any::from_msg(&pb::CompoundBTreeIndexDetails {
+                column_names: self.columns.clone(),
+                num_columns: self.columns.len() as u32,
+            })
+            .map_err(|e| Error::Internal {
+                message: format!("Failed to serialize index details: {}", e),
+                location: location!(),
+            })?,
+            index_version: COMPOUND_BTREE_INDEX_VERSION,
+        })
+    }
+
+    async fn update(
+        &self,
+        _new_data: SendableRecordBatchStream,
+        _dest_store: &dyn IndexStore,
+    ) -> Result<CreatedIndex> {
+        // Update is deferred to M4
+        Err(Error::NotSupported {
+            source: "Compound index update not yet implemented".into(),
+            location: location!(),
+        })
+    }
+
+    fn update_criteria(&self) -> UpdateCriteria {
+        UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::Values).with_row_id())
+    }
+
+    fn derive_index_params(&self) -> Result<super::ScalarIndexParams> {
+        let params = serde_json::to_value(CompoundBTreeParameters {
+            page_size: Some(self.batch_size),
+            column_names: self.columns.clone(),
+        })?;
+        Ok(super::ScalarIndexParams::new("CompoundBTree".to_string()).with_params(&params))
+    }
+}
+
+// ============================================================================
+// Plugin Implementation
+// ============================================================================
 
 /// Version number for compound BTree index.
 const COMPOUND_BTREE_INDEX_VERSION: u32 = 1;
@@ -1168,16 +1845,26 @@ impl ScalarIndexPlugin for CompoundBTreeIndexPlugin {
 
     async fn load_index(
         &self,
-        _index_store: Arc<dyn IndexStore>,
-        _index_details: &prost_types::Any,
-        _frag_reuse_index: Option<Arc<FragReuseIndex>>,
-        _cache: &LanceCache,
+        index_store: Arc<dyn IndexStore>,
+        index_details: &prost_types::Any,
+        frag_reuse_index: Option<Arc<FragReuseIndex>>,
+        cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        // Index loading is deferred to Milestone 3
-        Err(Error::NotSupported {
-            source: "Compound index loading not yet implemented (planned for M3)".into(),
-            location: location!(),
-        })
+        let details: pb::CompoundBTreeIndexDetails =
+            prost_types::Any::to_msg(index_details).map_err(|e| Error::Internal {
+                message: format!("Failed to deserialize compound index details: {}", e),
+                location: location!(),
+            })?;
+
+        let index = CompoundBTreeIndex::load(
+            index_store,
+            details.column_names,
+            frag_reuse_index,
+            cache,
+        )
+        .await?;
+
+        Ok(index)
     }
 
     fn details_as_json(&self, details: &prost_types::Any) -> Result<serde_json::Value> {
