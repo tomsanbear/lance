@@ -20,6 +20,7 @@
 //! - Column limits: 2-8 columns (soft limit)
 //! - Per-column statistics for flexible query pruning (implemented in later milestones)
 
+use std::any::Any;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::ops::Bound;
@@ -27,9 +28,12 @@ use std::ops::Bound;
 use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_row::{OwnedRow, RowConverter, Rows, SortField};
 use arrow_schema::{DataType, SortOptions};
-use datafusion_common::ScalarValue;
+use datafusion_common::{Column, ScalarValue};
+use datafusion_expr::Expr;
 use lance_core::{Error, Result};
 use snafu::location;
+
+use super::AnyQuery;
 
 // ============================================================================
 // Constants
@@ -510,6 +514,147 @@ impl CompoundSargableQuery {
             Self::PrefixLookup { prefix, .. } => prefix.len(),
             Self::Range { .. } => 0,
         }
+    }
+
+    /// Returns true if this query has a range component.
+    pub fn has_range(&self) -> bool {
+        match self {
+            Self::FullKeyLookup(_) => false,
+            Self::PrefixLookup { range, .. } => range.is_some(),
+            Self::Range { .. } => true,
+        }
+    }
+}
+
+impl AnyQuery for CompoundSargableQuery {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn format(&self, col: &str) -> String {
+        match self {
+            Self::FullKeyLookup(_key) => {
+                format!("{}[compound key lookup]", col)
+            }
+            Self::PrefixLookup { prefix, range } => {
+                let prefix_str = prefix
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| format!("col{}={}", i, v))
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                match range {
+                    Some((lower, upper)) => {
+                        let range_str = format_bound_range(lower, upper, prefix.len());
+                        format!("{} AND {}", prefix_str, range_str)
+                    }
+                    None => prefix_str,
+                }
+            }
+            Self::Range { lower, upper } => {
+                let lower_str = match lower {
+                    Bound::Unbounded => "(-∞".to_string(),
+                    Bound::Included(_) => "[key".to_string(),
+                    Bound::Excluded(_) => "(key".to_string(),
+                };
+                let upper_str = match upper {
+                    Bound::Unbounded => "∞)".to_string(),
+                    Bound::Included(_) => "key]".to_string(),
+                    Bound::Excluded(_) => "key)".to_string(),
+                };
+                format!("{} {} range: {}, {}", col, col, lower_str, upper_str)
+            }
+        }
+    }
+
+    fn to_expr(&self, col: String) -> Expr {
+        // For compound queries, we return a placeholder expression.
+        // The actual conversion back to DataFusion expressions requires
+        // knowing the column names, which is context the query doesn't have.
+        // This is primarily used for display/debugging purposes.
+        match self {
+            Self::FullKeyLookup(_) => {
+                // Return a simple column reference as placeholder
+                Expr::Column(Column::new_unqualified(col))
+            }
+            Self::PrefixLookup { prefix, range } => {
+                // Build AND expression for prefix columns
+                // This is a simplified representation
+                if prefix.is_empty() {
+                    return Expr::Literal(ScalarValue::Boolean(Some(true)), None);
+                }
+
+                let mut expr = Expr::Literal(ScalarValue::Boolean(Some(true)), None);
+                for (i, val) in prefix.iter().enumerate() {
+                    let col_expr = Expr::Column(Column::new_unqualified(format!("{}_{}", col, i)));
+                    let eq_expr = col_expr.eq(Expr::Literal(val.clone(), None));
+                    expr = expr.and(eq_expr);
+                }
+
+                // Add range if present
+                if let Some((lower, upper)) = range {
+                    let range_col =
+                        Expr::Column(Column::new_unqualified(format!("{}_{}", col, prefix.len())));
+                    let range_expr = build_range_expr(range_col, lower, upper);
+                    expr = expr.and(range_expr);
+                }
+
+                expr
+            }
+            Self::Range { .. } => {
+                // Range on compound key - return placeholder
+                Expr::Column(Column::new_unqualified(col))
+            }
+        }
+    }
+
+    fn dyn_eq(&self, other: &dyn AnyQuery) -> bool {
+        match other.as_any().downcast_ref::<Self>() {
+            Some(o) => self == o,
+            None => false,
+        }
+    }
+}
+
+/// Format a bound range for display.
+fn format_bound_range(lower: &Bound<ScalarValue>, upper: &Bound<ScalarValue>, col_idx: usize) -> String {
+    match (lower, upper) {
+        (Bound::Unbounded, Bound::Unbounded) => format!("col{} IN (-∞, ∞)", col_idx),
+        (Bound::Unbounded, Bound::Included(v)) => format!("col{} <= {}", col_idx, v),
+        (Bound::Unbounded, Bound::Excluded(v)) => format!("col{} < {}", col_idx, v),
+        (Bound::Included(v), Bound::Unbounded) => format!("col{} >= {}", col_idx, v),
+        (Bound::Excluded(v), Bound::Unbounded) => format!("col{} > {}", col_idx, v),
+        (Bound::Included(l), Bound::Included(u)) => format!("col{} BETWEEN {} AND {}", col_idx, l, u),
+        (Bound::Included(l), Bound::Excluded(u)) => format!("col{} >= {} AND col{} < {}", col_idx, l, col_idx, u),
+        (Bound::Excluded(l), Bound::Included(u)) => format!("col{} > {} AND col{} <= {}", col_idx, l, col_idx, u),
+        (Bound::Excluded(l), Bound::Excluded(u)) => format!("col{} > {} AND col{} < {}", col_idx, l, col_idx, u),
+    }
+}
+
+/// Build a range expression for DataFusion.
+fn build_range_expr(col: Expr, lower: &Bound<ScalarValue>, upper: &Bound<ScalarValue>) -> Expr {
+    match (lower, upper) {
+        (Bound::Unbounded, Bound::Unbounded) => Expr::Literal(ScalarValue::Boolean(Some(true)), None),
+        (Bound::Unbounded, Bound::Included(v)) => col.lt_eq(Expr::Literal(v.clone(), None)),
+        (Bound::Unbounded, Bound::Excluded(v)) => col.lt(Expr::Literal(v.clone(), None)),
+        (Bound::Included(v), Bound::Unbounded) => col.gt_eq(Expr::Literal(v.clone(), None)),
+        (Bound::Excluded(v), Bound::Unbounded) => col.gt(Expr::Literal(v.clone(), None)),
+        (Bound::Included(l), Bound::Included(u)) => col
+            .clone()
+            .gt_eq(Expr::Literal(l.clone(), None))
+            .and(col.lt_eq(Expr::Literal(u.clone(), None))),
+        (Bound::Included(l), Bound::Excluded(u)) => col
+            .clone()
+            .gt_eq(Expr::Literal(l.clone(), None))
+            .and(col.lt(Expr::Literal(u.clone(), None))),
+        (Bound::Excluded(l), Bound::Included(u)) => col
+            .clone()
+            .gt(Expr::Literal(l.clone(), None))
+            .and(col.lt_eq(Expr::Literal(u.clone(), None))),
+        (Bound::Excluded(l), Bound::Excluded(u)) => col
+            .clone()
+            .gt(Expr::Literal(l.clone(), None))
+            .and(col.lt(Expr::Literal(u.clone(), None))),
     }
 }
 
@@ -1119,5 +1264,113 @@ mod tests {
         let cloned = key.clone();
         assert_eq!(key, cloned);
         assert_eq!(key.as_bytes(), cloned.as_bytes());
+    }
+
+    // ========================================================================
+    // AnyQuery Implementation Tests
+    // ========================================================================
+
+    #[test]
+    fn test_any_query_format_prefix_lookup() {
+        let query = CompoundSargableQuery::prefix_lookup(vec![
+            ScalarValue::Utf8(Some("tenant".to_string())),
+            ScalarValue::Int64(Some(42)),
+        ]);
+
+        let formatted = query.format("index");
+        assert!(formatted.contains("col0="));
+        assert!(formatted.contains("col1="));
+    }
+
+    #[test]
+    fn test_any_query_format_prefix_with_range() {
+        let query = CompoundSargableQuery::prefix_lookup_with_range(
+            vec![ScalarValue::Utf8(Some("tenant".to_string()))],
+            (
+                Bound::Included(ScalarValue::Int64(Some(100))),
+                Bound::Excluded(ScalarValue::Int64(Some(200))),
+            ),
+        );
+
+        let formatted = query.format("index");
+        assert!(formatted.contains("col0="));
+        assert!(formatted.contains("col1"));
+    }
+
+    #[test]
+    fn test_any_query_dyn_eq() {
+        let query1 = CompoundSargableQuery::prefix_lookup(vec![
+            ScalarValue::Utf8(Some("tenant".to_string())),
+        ]);
+
+        let query2 = CompoundSargableQuery::prefix_lookup(vec![
+            ScalarValue::Utf8(Some("tenant".to_string())),
+        ]);
+
+        let query3 = CompoundSargableQuery::prefix_lookup(vec![
+            ScalarValue::Utf8(Some("other".to_string())),
+        ]);
+
+        // Same query should be equal
+        assert!(query1.dyn_eq(&query2));
+
+        // Different query should not be equal
+        assert!(!query1.dyn_eq(&query3));
+    }
+
+    #[test]
+    fn test_any_query_as_any_downcast() {
+        let query = CompoundSargableQuery::prefix_lookup(vec![
+            ScalarValue::Utf8(Some("tenant".to_string())),
+        ]);
+
+        let any_ref = query.as_any();
+        let downcasted = any_ref.downcast_ref::<CompoundSargableQuery>();
+        assert!(downcasted.is_some());
+
+        if let Some(CompoundSargableQuery::PrefixLookup { prefix, .. }) = downcasted {
+            assert_eq!(prefix.len(), 1);
+        } else {
+            panic!("Expected PrefixLookup");
+        }
+    }
+
+    #[test]
+    fn test_has_range() {
+        let (_schema, converter) =
+            create_test_schema(vec!["s", "i"], vec![DataType::Utf8, DataType::Int64]).unwrap();
+
+        let key = CompoundKey::from_scalars(
+            &converter,
+            &[
+                ScalarValue::Utf8(Some("test".to_string())),
+                ScalarValue::Int64(Some(42)),
+            ],
+        )
+        .unwrap();
+
+        // Full key lookup has no range
+        let query1 = CompoundSargableQuery::full_key_lookup(key.clone());
+        assert!(!query1.has_range());
+
+        // Prefix lookup without range
+        let query2 = CompoundSargableQuery::prefix_lookup(vec![
+            ScalarValue::Utf8(Some("tenant".to_string())),
+        ]);
+        assert!(!query2.has_range());
+
+        // Prefix lookup with range
+        let query3 = CompoundSargableQuery::prefix_lookup_with_range(
+            vec![ScalarValue::Utf8(Some("tenant".to_string()))],
+            (Bound::Included(ScalarValue::Int64(Some(100))), Bound::Unbounded),
+        );
+        assert!(query3.has_range());
+
+        // Range query
+        let query4 = CompoundSargableQuery::range(
+            Bound::Included(key.clone()),
+            Bound::Excluded(key),
+        );
+        assert!(query4.has_range());
     }
 }
