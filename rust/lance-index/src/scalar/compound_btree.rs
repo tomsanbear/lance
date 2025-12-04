@@ -686,6 +686,72 @@ impl CompoundBTreeLookup {
             .map(|stats| stats.page_number)
             .collect()
     }
+
+    /// Compute global min/max bounds for a column by aggregating across all pages.
+    ///
+    /// Returns `(global_min, global_max, total_null_count)` for the specified column,
+    /// or `None` if there are no pages or the column index is out of bounds.
+    ///
+    /// This is useful for surfacing column statistics to query planners without
+    /// needing to scan actual data pages.
+    pub fn global_bounds(&self, col_idx: usize) -> Option<(ScalarValue, ScalarValue, u64)> {
+        if col_idx >= self.num_columns || self.page_stats.is_empty() {
+            return None;
+        }
+
+        let mut global_min: Option<ScalarValue> = None;
+        let mut global_max: Option<ScalarValue> = None;
+        let mut total_null_count: u64 = 0;
+
+        for stats in &self.page_stats {
+            if col_idx >= stats.mins.len() {
+                continue;
+            }
+
+            total_null_count += stats.null_counts[col_idx] as u64;
+
+            let page_min = &stats.mins[col_idx];
+            let page_max = &stats.maxs[col_idx];
+
+            // Skip null bounds (page is entirely null for this column)
+            if page_min.is_null() && page_max.is_null() {
+                continue;
+            }
+
+            // Update global min (take the smaller value)
+            if !page_min.is_null() {
+                global_min = Some(match global_min {
+                    None => page_min.clone(),
+                    Some(ref current) => {
+                        if page_min < current {
+                            page_min.clone()
+                        } else {
+                            current.clone()
+                        }
+                    }
+                });
+            }
+
+            // Update global max (take the larger value)
+            if !page_max.is_null() {
+                global_max = Some(match global_max {
+                    None => page_max.clone(),
+                    Some(ref current) => {
+                        if page_max > current {
+                            page_max.clone()
+                        } else {
+                            current.clone()
+                        }
+                    }
+                });
+            }
+        }
+
+        match (global_min, global_max) {
+            (Some(min), Some(max)) => Some((min, max, total_null_count)),
+            _ => None,
+        }
+    }
 }
 
 /// Analyze a compound batch to extract per-column statistics.
@@ -1241,6 +1307,16 @@ impl CompoundBTreeIndex {
     /// Get the number of pages in this index.
     pub fn num_pages(&self) -> usize {
         self.page_lookup.num_pages()
+    }
+
+    /// Compute global min/max bounds for a column by aggregating across all pages.
+    ///
+    /// Returns `(global_min, global_max, total_null_count)` for the specified column,
+    /// or `None` if there are no pages or the column index is out of bounds.
+    ///
+    /// This delegates to `CompoundBTreeLookup::global_bounds()`.
+    pub fn global_bounds(&self, col_idx: usize) -> Option<(ScalarValue, ScalarValue, u64)> {
+        self.page_lookup.global_bounds(col_idx)
     }
 
     /// Look up a page, using cache if available.
