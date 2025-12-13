@@ -151,11 +151,7 @@ impl DeepSizeOf for CompoundFlatIndexMetadata {
                         + f.metadata().deep_size_of_children(context)
                 })
                 .sum::<usize>()
-            + self
-                .column_names
-                .iter()
-                .map(|n| n.deep_size_of_children(context))
-                .sum::<usize>()
+            + self.column_names.iter().map(|n| n.deep_size_of_children(context)).sum::<usize>()
     }
 }
 
@@ -267,11 +263,7 @@ impl CompoundBTreeSubIndex for CompoundFlatIndexMetadata {
             .iter()
             .enumerate()
             .filter_map(|(idx, old_id)| {
-                mapping
-                    .get(old_id)
-                    .copied()
-                    .unwrap_or(Some(*old_id))
-                    .map(|new_id| (idx, new_id))
+                mapping.get(old_id).copied().unwrap_or(Some(*old_id)).map(|new_id| (idx, new_id))
             })
             .collect();
 
@@ -282,9 +274,7 @@ impl CompoundBTreeSubIndex for CompoundFlatIndexMetadata {
 
         // Create indices for taking from value columns
         let take_indices = UInt64Array::from_iter_values(
-            val_idx_and_new_id
-                .into_iter()
-                .map(|(val_idx, _)| val_idx as u64),
+            val_idx_and_new_id.into_iter().map(|(val_idx, _)| val_idx as u64),
         );
 
         // Take from all value columns and build new batch
@@ -388,11 +378,7 @@ impl CompoundBTreeLookup {
     /// Create a new CompoundBTreeLookup from parsed page statistics.
     pub fn new(page_stats: Vec<CompoundPageStats>, data_types: Vec<DataType>) -> Self {
         let num_columns = data_types.len();
-        Self {
-            page_stats,
-            num_columns,
-            data_types,
-        }
+        Self { page_stats, num_columns, data_types }
     }
 
     /// Parse a CompoundBTreeLookup from the serialized lookup batch.
@@ -406,10 +392,7 @@ impl CompoundBTreeLookup {
     /// ```
     ///
     /// Data types are extracted from the schema (min_col* columns).
-    pub fn try_from_serialized(
-        lookup_batch: RecordBatch,
-        column_names: &[String],
-    ) -> Result<Self> {
+    pub fn try_from_serialized(lookup_batch: RecordBatch, column_names: &[String]) -> Result<Self> {
         let schema = lookup_batch.schema();
         let num_columns = column_names.len();
 
@@ -447,28 +430,20 @@ impl CompoundBTreeLookup {
 
                 // min_col
                 let min_col = lookup_batch.column(base_idx);
-                let min_val = ScalarValue::try_from_array(min_col, row_idx).map_err(|e| {
-                    Error::Index {
-                        message: format!(
-                            "Failed to read min value for column {}: {}",
-                            col_name, e
-                        ),
+                let min_val =
+                    ScalarValue::try_from_array(min_col, row_idx).map_err(|e| Error::Index {
+                        message: format!("Failed to read min value for column {}: {}", col_name, e),
                         location: location!(),
-                    }
-                })?;
+                    })?;
                 mins.push(min_val);
 
                 // max_col
                 let max_col = lookup_batch.column(base_idx + 1);
-                let max_val = ScalarValue::try_from_array(max_col, row_idx).map_err(|e| {
-                    Error::Index {
-                        message: format!(
-                            "Failed to read max value for column {}: {}",
-                            col_name, e
-                        ),
+                let max_val =
+                    ScalarValue::try_from_array(max_col, row_idx).map_err(|e| Error::Index {
+                        message: format!("Failed to read max value for column {}: {}", col_name, e),
                         location: location!(),
-                    }
-                })?;
+                    })?;
                 maxs.push(max_val);
 
                 // null_count_col
@@ -477,10 +452,7 @@ impl CompoundBTreeLookup {
                     .as_any()
                     .downcast_ref::<UInt32Array>()
                     .ok_or_else(|| Error::Index {
-                        message: format!(
-                            "null_count column for {} is not UInt32",
-                            col_name
-                        ),
+                        message: format!("null_count column for {} is not UInt32", col_name),
                         location: location!(),
                     })?;
                 null_counts.push(null_count_col.value(row_idx));
@@ -488,12 +460,7 @@ impl CompoundBTreeLookup {
 
             let page_number = page_idx_col.value(row_idx);
 
-            page_stats.push(CompoundPageStats {
-                mins,
-                maxs,
-                null_counts,
-                page_number,
-            });
+            page_stats.push(CompoundPageStats { mins, maxs, null_counts, page_number });
         }
 
         Ok(Self::new(page_stats, data_types))
@@ -770,7 +737,10 @@ impl CompoundBTreeLookup {
 /// # Returns
 ///
 /// Statistics for each column in the batch.
-fn analyze_compound_batch(batch: &RecordBatch, num_value_columns: usize) -> Result<Vec<ColumnStats>> {
+fn analyze_compound_batch(
+    batch: &RecordBatch,
+    num_value_columns: usize,
+) -> Result<Vec<ColumnStats>> {
     if batch.num_rows() == 0 {
         return Err(Error::Internal {
             message: "Received an empty batch in compound btree training".to_string(),
@@ -788,11 +758,7 @@ fn analyze_compound_batch(batch: &RecordBatch, num_value_columns: usize) -> Resu
         // (all columns together) is sorted, not individual columns.
         let (min, max) = compute_column_min_max(col, i)?;
 
-        stats.push(ColumnStats {
-            min,
-            max,
-            null_count: col.null_count() as u32,
-        });
+        stats.push(ColumnStats { min, max, null_count: col.null_count() as u32 });
     }
 
     Ok(stats)
@@ -828,10 +794,11 @@ fn compute_column_min_max(col: &ArrayRef, col_idx: usize) -> Result<(ScalarValue
         return Ok((null_val.clone(), null_val));
     };
 
-    let mut min = ScalarValue::try_from_array(col, first_valid_idx).map_err(|e| Error::Internal {
-        message: format!("Failed to get initial min value for column {}: {}", col_idx, e),
-        location: location!(),
-    })?;
+    let mut min =
+        ScalarValue::try_from_array(col, first_valid_idx).map_err(|e| Error::Internal {
+            message: format!("Failed to get initial min value for column {}: {}", col_idx, e),
+            location: location!(),
+        })?;
     let mut max = min.clone();
 
     // Scan remaining rows to find true min/max
@@ -873,10 +840,7 @@ async fn train_compound_page(
     let stats = analyze_compound_batch(&batch, num_value_columns)?;
     let trained = sub_index_trainer.train(batch).await?;
     writer.write_record_batch(trained).await?;
-    Ok(EncodedCompoundBatch {
-        stats,
-        page_number: batch_idx,
-    })
+    Ok(EncodedCompoundBatch { stats, page_number: batch_idx })
 }
 
 // ============================================================================
@@ -965,11 +929,7 @@ fn compound_stats_as_batch(
             columns[i * 3 + 1].data_type().clone(),
             true,
         ));
-        fields.push(Field::new(
-            format!("null_count_{}", column_names[i]),
-            DataType::UInt32,
-            false,
-        ));
+        fields.push(Field::new(format!("null_count_{}", column_names[i]), DataType::UInt32, false));
     }
     fields.push(Field::new("page_idx", DataType::UInt32, false));
 
@@ -1044,9 +1004,8 @@ pub async fn train_compound_btree_index(
     };
 
     // Create page data file
-    let mut page_data_file = index_store
-        .new_index_file(&page_data_name, sub_index_trainer.schema().clone())
-        .await?;
+    let mut page_data_file =
+        index_store.new_index_file(&page_data_name, sub_index_trainer.schema().clone()).await?;
 
     let column_names = compound_schema.columns().to_vec();
     let data_types = compound_schema.data_types().to_vec();
@@ -1076,14 +1035,10 @@ pub async fn train_compound_btree_index(
     let lookup_batch = compound_stats_as_batch(encoded_batches, &column_names, &data_types)?;
 
     let mut file_schema = lookup_batch.schema().as_ref().clone();
-    file_schema.metadata.insert(
-        COMPOUND_BATCH_SIZE_META_KEY.to_string(),
-        batch_size.to_string(),
-    );
+    file_schema.metadata.insert(COMPOUND_BATCH_SIZE_META_KEY.to_string(), batch_size.to_string());
 
-    let mut lookup_file = index_store
-        .new_index_file(&page_lookup_name, Arc::new(file_schema))
-        .await?;
+    let mut lookup_file =
+        index_store.new_index_file(&page_lookup_name, Arc::new(file_schema)).await?;
 
     lookup_file.write_record_batch(lookup_batch).await?;
     lookup_file.finish().await?;
@@ -1118,7 +1073,9 @@ use crate::frag_reuse::FragReuseIndex;
 use crate::metrics::{MetricsCollector, NoOpMetricsCollector};
 use crate::pb;
 use crate::scalar::expression::ScalarQueryParser;
-use crate::scalar::registry::{ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest};
+use crate::scalar::registry::{
+    ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+};
 use crate::scalar::{AnyQuery, CreatedIndex, IndexReader, SearchResult, UpdateCriteria};
 use crate::Index;
 use arrow_schema::SortOptions;
@@ -1139,7 +1096,7 @@ use tracing::debug;
 use super::compound::CompoundSargableQuery;
 
 /// Lazy index reader for compound index pages.
-/// 
+///
 /// Only opens the file reader if/when needed (e.g., if pages aren't cached).
 #[derive(Clone)]
 struct LazyCompoundIndexReader {
@@ -1149,10 +1106,7 @@ struct LazyCompoundIndexReader {
 
 impl LazyCompoundIndexReader {
     fn new(store: Arc<dyn IndexStore>) -> Self {
-        Self {
-            index_reader: Arc::new(tokio::sync::Mutex::new(None)),
-            store,
-        }
+        Self { index_reader: Arc::new(tokio::sync::Mutex::new(None)), store }
     }
 
     async fn get(&self) -> Result<Arc<dyn IndexReader>> {
@@ -1239,8 +1193,7 @@ pub struct CompoundBTreeIndex {
 
 impl DeepSizeOf for CompoundBTreeIndex {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        self.page_lookup.deep_size_of_children(context)
-            + self.store.deep_size_of_children(context)
+        self.page_lookup.deep_size_of_children(context) + self.store.deep_size_of_children(context)
     }
 }
 
@@ -1273,14 +1226,13 @@ impl CompoundBTreeIndex {
             .unwrap_or(DEFAULT_COMPOUND_BATCH_SIZE);
 
         // Build the lookup structure (extracts data types from schema)
-        let page_lookup = CompoundBTreeLookup::try_from_serialized(serialized_lookup, &column_names)?;
+        let page_lookup =
+            CompoundBTreeLookup::try_from_serialized(serialized_lookup, &column_names)?;
         let data_types = page_lookup.data_types().to_vec();
 
         // Create sub_index metadata
-        let sub_index = Arc::new(CompoundFlatIndexMetadata::new(
-            column_names.clone(),
-            data_types.clone(),
-        ));
+        let sub_index =
+            Arc::new(CompoundFlatIndexMetadata::new(column_names.clone(), data_types.clone()));
 
         Ok(Arc::new(Self {
             columns: column_names,
@@ -1344,9 +1296,7 @@ impl CompoundBTreeIndex {
     ) -> Result<RecordBatch> {
         metrics.record_part_load();
         let reader = index_reader.get().await?;
-        let mut batch = reader
-            .read_record_batch(page_number as u64, self.batch_size)
-            .await?;
+        let mut batch = reader.read_record_batch(page_number as u64, self.batch_size).await?;
 
         // Apply fragment reuse remapping if present
         if let Some(fri) = &self.frag_reuse_index {
@@ -1375,15 +1325,11 @@ impl CompoundBTreeIndex {
         query: &CompoundSargableQuery,
     ) -> Result<RowAddrTreeMap> {
         match query {
-            CompoundSargableQuery::FullKeyLookup(key) => {
-                self.search_full_key(batch, key)
-            }
+            CompoundSargableQuery::FullKeyLookup(key) => self.search_full_key(batch, key),
             CompoundSargableQuery::PrefixLookup { prefix, range } => {
                 self.search_prefix(batch, prefix, range.as_ref())
             }
-            CompoundSargableQuery::Range { lower, upper } => {
-                self.search_range(batch, lower, upper)
-            }
+            CompoundSargableQuery::Range { lower, upper } => self.search_range(batch, lower, upper),
         }
     }
 
@@ -1397,7 +1343,8 @@ impl CompoundBTreeIndex {
         let converter = create_compound_row_converter(&self.data_types)?;
 
         // Convert page columns to rows
-        let value_cols: Vec<ArrayRef> = self.columns
+        let value_cols: Vec<ArrayRef> = self
+            .columns
             .iter()
             .map(|name| batch.column_by_name(name).cloned())
             .collect::<Option<Vec<_>>>()
@@ -1461,19 +1408,17 @@ impl CompoundBTreeIndex {
 
             // Check prefix columns for equality
             for (col_idx, expected_value) in prefix.iter().enumerate() {
-                let col = batch.column_by_name(&self.columns[col_idx]).ok_or_else(|| {
-                    Error::Index {
+                let col =
+                    batch.column_by_name(&self.columns[col_idx]).ok_or_else(|| Error::Index {
                         message: format!("Missing column {} in page", self.columns[col_idx]),
                         location: location!(),
-                    }
-                })?;
+                    })?;
 
-                let actual_value = ScalarValue::try_from_array(col, row_idx).map_err(|e| {
-                    Error::Index {
+                let actual_value =
+                    ScalarValue::try_from_array(col, row_idx).map_err(|e| Error::Index {
                         message: format!("Failed to get value at row {}: {}", row_idx, e),
                         location: location!(),
-                    }
-                })?;
+                    })?;
 
                 if actual_value != *expected_value {
                     matches = false;
@@ -1486,7 +1431,8 @@ impl CompoundBTreeIndex {
                 if let Some((lower, upper)) = range {
                     let range_col_idx = prefix.len();
                     if range_col_idx < self.columns.len() {
-                        matches = self.matches_range(batch, row_idx, range_col_idx, lower, upper)?;
+                        matches =
+                            self.matches_range(batch, row_idx, range_col_idx, lower, upper)?;
                     }
                 }
             }
@@ -1530,9 +1476,7 @@ impl CompoundBTreeIndex {
             Bound::Included(v) => {
                 value.partial_cmp(v).is_some_and(|o| o != std::cmp::Ordering::Less)
             }
-            Bound::Excluded(v) => {
-                value.partial_cmp(v) == Some(std::cmp::Ordering::Greater)
-            }
+            Bound::Excluded(v) => value.partial_cmp(v) == Some(std::cmp::Ordering::Greater),
         };
 
         let upper_ok = match upper {
@@ -1540,9 +1484,7 @@ impl CompoundBTreeIndex {
             Bound::Included(v) => {
                 value.partial_cmp(v).is_some_and(|o| o != std::cmp::Ordering::Greater)
             }
-            Bound::Excluded(v) => {
-                value.partial_cmp(v) == Some(std::cmp::Ordering::Less)
-            }
+            Bound::Excluded(v) => value.partial_cmp(v) == Some(std::cmp::Ordering::Less),
         };
 
         Ok(lower_ok && upper_ok)
@@ -1561,7 +1503,8 @@ impl CompoundBTreeIndex {
         let converter = create_compound_row_converter(&self.data_types)?;
 
         // Convert page columns to rows
-        let value_cols: Vec<ArrayRef> = self.columns
+        let value_cols: Vec<ArrayRef> = self
+            .columns
             .iter()
             .map(|name| batch.column_by_name(name).cloned())
             .collect::<Option<Vec<_>>>()
@@ -1642,9 +1585,7 @@ impl Index for CompoundBTreeIndex {
             let inserted = self
                 .index_cache
                 .insert_with_key(
-                    &CompoundBTreePageKey {
-                        page_number: page_idx as u32,
-                    },
+                    &CompoundBTreePageKey { page_number: page_idx as u32 },
                     Arc::new(CachedCompoundPage::new(page)),
                 )
                 .await;
@@ -1679,9 +1620,7 @@ impl Index for CompoundBTreeIndex {
         let num_batches = page_reader.num_batches(self.batch_size).await;
 
         for page_idx in 0..num_batches {
-            let batch = page_reader
-                .read_record_batch(page_idx as u64, self.batch_size)
-                .await?;
+            let batch = page_reader.read_record_batch(page_idx as u64, self.batch_size).await?;
 
             let row_ids = batch
                 .column_by_name(COMPOUND_IDS_COLUMN)
@@ -1714,7 +1653,7 @@ impl CompoundBTreeIndex {
     async fn into_data_stream(self) -> Result<SendableRecordBatchStream> {
         let reader = self.store.open_index_file(COMPOUND_PAGES_NAME).await?;
         let num_batches = reader.num_batches(self.batch_size).await;
-        
+
         // Build output schema with generic column names: col0, col1, ..., colN, _rowid
         let num_value_cols = self.columns.len();
         let mut fields = Vec::with_capacity(num_value_cols + 1);
@@ -1732,9 +1671,7 @@ impl CompoundBTreeIndex {
 
         let page_stream = stream::iter((0..num_batches).map(move |page_num| {
             let reader = reader.clone();
-            async move {
-                reader.read_record_batch(page_num as u64, batch_size).await
-            }
+            async move { reader.read_record_batch(page_num as u64, batch_size).await }
         }));
 
         let batches = page_stream
@@ -1748,15 +1685,12 @@ impl CompoundBTreeIndex {
                 }
                 // The last column is _rowid
                 columns.push(batch.column(source_col_count).clone());
-                
+
                 RecordBatch::try_new(new_schema.clone(), columns).unwrap()
             })
             .boxed();
 
-        Ok(Box::pin(RecordBatchStreamAdapter::new(
-            new_schema_clone,
-            batches,
-        )))
+        Ok(Box::pin(RecordBatchStreamAdapter::new(new_schema_clone, batches)))
     }
 
     /// Create an execution plan from the index data.
@@ -1789,28 +1723,23 @@ impl CompoundBTreeIndex {
             let col_name = format!("col{}", i);
             sort_exprs.push(PhysicalSortExpr {
                 expr: Arc::new(Column::new(&col_name, i)),
-                options: SortOptions {
-                    descending: false,
-                    nulls_first: true,
-                },
+                options: SortOptions { descending: false, nulls_first: true },
             });
         }
 
         // Union the two inputs and merge them in sorted order
         let all_data = Arc::new(UnionExec::new(vec![old_input, new_input]));
-        let ordering = datafusion_physical_expr::LexOrdering::new(sort_exprs)
-            .ok_or_else(|| Error::Internal {
+        let ordering = datafusion_physical_expr::LexOrdering::new(sort_exprs).ok_or_else(|| {
+            Error::Internal {
                 message: "Failed to create LexOrdering for compound index merge".to_string(),
                 location: location!(),
-            })?;
+            }
+        })?;
         let ordered = Arc::new(SortPreservingMergeExec::new(ordering, all_data));
 
         let unchunked = execute_plan(
             ordered,
-            LanceExecutionOptions {
-                use_spilling: true,
-                ..Default::default()
-            },
+            LanceExecutionOptions { use_spilling: true, ..Default::default() },
         )?;
 
         Ok(chunk_concat_stream(unchunked, chunk_size as usize))
@@ -1825,10 +1754,8 @@ impl ScalarIndex for CompoundBTreeIndex {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
-        let query = query
-            .as_any()
-            .downcast_ref::<CompoundSargableQuery>()
-            .ok_or_else(|| Error::Index {
+        let query =
+            query.as_any().downcast_ref::<CompoundSargableQuery>().ok_or_else(|| Error::Index {
                 message: "CompoundBTreeIndex expects CompoundSargableQuery".to_string(),
                 location: location!(),
             })?;
@@ -1854,7 +1781,7 @@ impl ScalarIndex for CompoundBTreeIndex {
             .try_collect::<RowAddrTreeMap>()
             .await?;
 
-        Ok(SearchResult::Exact(row_ids))
+        Ok(SearchResult::exact(row_ids))
     }
 
     fn can_remap(&self) -> bool {
@@ -1867,17 +1794,14 @@ impl ScalarIndex for CompoundBTreeIndex {
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         // Remap and write pages
-        let mut page_file = dest_store
-            .new_index_file(COMPOUND_PAGES_NAME, self.sub_index.schema().clone())
-            .await?;
+        let mut page_file =
+            dest_store.new_index_file(COMPOUND_PAGES_NAME, self.sub_index.schema().clone()).await?;
 
         let page_reader = self.store.open_index_file(COMPOUND_PAGES_NAME).await?;
         let num_batches = page_reader.num_batches(self.batch_size).await;
 
         for page_idx in 0..num_batches {
-            let batch = page_reader
-                .read_record_batch(page_idx as u64, self.batch_size)
-                .await?;
+            let batch = page_reader.read_record_batch(page_idx as u64, self.batch_size).await?;
             let remapped = self.sub_index.remap_subindex(batch, mapping).await?;
             page_file.write_record_batch(remapped).await?;
         }
@@ -1885,9 +1809,7 @@ impl ScalarIndex for CompoundBTreeIndex {
         page_file.finish().await?;
 
         // Copy lookup file as-is
-        self.store
-            .copy_index_file(COMPOUND_LOOKUP_NAME, dest_store)
-            .await?;
+        self.store.copy_index_file(COMPOUND_LOOKUP_NAME, dest_store).await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pb::CompoundBTreeIndexDetails {
@@ -1908,16 +1830,11 @@ impl ScalarIndex for CompoundBTreeIndex {
         dest_store: &dyn IndexStore,
     ) -> Result<CreatedIndex> {
         // Merge the existing index data with the new data
-        let merged_data_source = self
-            .clone()
-            .combine_old_new(new_data, self.batch_size)
-            .await?;
+        let merged_data_source = self.clone().combine_old_new(new_data, self.batch_size).await?;
 
         // Create compound schema for training
-        let compound_schema = CompoundIndexSchema::new(
-            self.columns.clone(),
-            self.data_types.clone(),
-        )?;
+        let compound_schema =
+            CompoundIndexSchema::new(self.columns.clone(), self.data_types.clone())?;
 
         // Retrain the index with merged data
         train_compound_btree_index(
@@ -1998,11 +1915,7 @@ pub struct CompoundQueryParser {
 impl CompoundQueryParser {
     /// Create a new CompoundQueryParser.
     pub fn new(index_name: String, columns: Vec<String>, data_types: Vec<DataType>) -> Self {
-        Self {
-            index_name,
-            columns,
-            data_types,
-        }
+        Self { index_name, columns, data_types }
     }
 
     /// Get the column names in this index.
@@ -2120,24 +2033,18 @@ impl ScalarQueryParser for CompoundQueryParser {
                     (std::ops::Bound::Unbounded, std::ops::Bound::Excluded(value.clone())),
                 )
             }
-            Operator::LtEq => {
-                CompoundSargableQuery::prefix_lookup_with_range(
-                    vec![],
-                    (std::ops::Bound::Unbounded, std::ops::Bound::Included(value.clone())),
-                )
-            }
-            Operator::Gt => {
-                CompoundSargableQuery::prefix_lookup_with_range(
-                    vec![],
-                    (std::ops::Bound::Excluded(value.clone()), std::ops::Bound::Unbounded),
-                )
-            }
-            Operator::GtEq => {
-                CompoundSargableQuery::prefix_lookup_with_range(
-                    vec![],
-                    (std::ops::Bound::Included(value.clone()), std::ops::Bound::Unbounded),
-                )
-            }
+            Operator::LtEq => CompoundSargableQuery::prefix_lookup_with_range(
+                vec![],
+                (std::ops::Bound::Unbounded, std::ops::Bound::Included(value.clone())),
+            ),
+            Operator::Gt => CompoundSargableQuery::prefix_lookup_with_range(
+                vec![],
+                (std::ops::Bound::Excluded(value.clone()), std::ops::Bound::Unbounded),
+            ),
+            Operator::GtEq => CompoundSargableQuery::prefix_lookup_with_range(
+                vec![],
+                (std::ops::Bound::Included(value.clone()), std::ops::Bound::Unbounded),
+            ),
             // NotEq will be handled by caller via maybe_not()
             Operator::NotEq => CompoundSargableQuery::prefix_lookup(vec![value.clone()]),
             _ => return None,
@@ -2180,10 +2087,7 @@ pub struct CompoundBTreeTrainingRequest {
 
 impl CompoundBTreeTrainingRequest {
     pub fn new(parameters: CompoundBTreeParameters) -> Self {
-        Self {
-            criteria: TrainingCriteria::new(TrainingOrdering::Values).with_row_id(),
-            parameters,
-        }
+        Self { criteria: TrainingCriteria::new(TrainingOrdering::Values).with_row_id(), parameters }
     }
 }
 
@@ -2269,11 +2173,7 @@ impl ScalarIndexPlugin for CompoundBTreeIndexPlugin {
         // the data types from the loaded index.
         let data_types: Vec<DataType> = vec![DataType::Null; details.column_names.len()];
 
-        Some(Box::new(CompoundQueryParser::new(
-            index_name,
-            details.column_names,
-            data_types,
-        )))
+        Some(Box::new(CompoundQueryParser::new(index_name, details.column_names, data_types)))
     }
 
     async fn train_index(
@@ -2283,12 +2183,12 @@ impl ScalarIndexPlugin for CompoundBTreeIndexPlugin {
         request: Box<dyn TrainingRequest>,
         fragment_ids: Option<Vec<u32>>,
     ) -> Result<CreatedIndex> {
-        let request = request
-            .as_any()
-            .downcast_ref::<CompoundBTreeTrainingRequest>()
-            .ok_or_else(|| Error::Internal {
-                message: "Invalid training request type for CompoundBTree".to_string(),
-                location: location!(),
+        let request =
+            request.as_any().downcast_ref::<CompoundBTreeTrainingRequest>().ok_or_else(|| {
+                Error::Internal {
+                    message: "Invalid training request type for CompoundBTree".to_string(),
+                    location: location!(),
+                }
             })?;
 
         // Extract column information from the data schema
@@ -2308,13 +2208,12 @@ impl ScalarIndexPlugin for CompoundBTreeIndexPlugin {
         let data_types: Vec<DataType> = column_names
             .iter()
             .map(|name| {
-                schema
-                    .field_with_name(name)
-                    .map(|f| f.data_type().clone())
-                    .map_err(|_| Error::Index {
+                schema.field_with_name(name).map(|f| f.data_type().clone()).map_err(|_| {
+                    Error::Index {
                         message: format!("Column '{}' not found in training data", name),
                         location: location!(),
-                    })
+                    }
+                })
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -2357,19 +2256,15 @@ impl ScalarIndexPlugin for CompoundBTreeIndexPlugin {
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         cache: &LanceCache,
     ) -> Result<Arc<dyn ScalarIndex>> {
-        let details: pb::CompoundBTreeIndexDetails =
-            prost_types::Any::to_msg(index_details).map_err(|e| Error::Internal {
+        let details: pb::CompoundBTreeIndexDetails = prost_types::Any::to_msg(index_details)
+            .map_err(|e| Error::Internal {
                 message: format!("Failed to deserialize compound index details: {}", e),
                 location: location!(),
             })?;
 
-        let index = CompoundBTreeIndex::load(
-            index_store,
-            details.column_names,
-            frag_reuse_index,
-            cache,
-        )
-        .await?;
+        let index =
+            CompoundBTreeIndex::load(index_store, details.column_names, frag_reuse_index, cache)
+                .await?;
 
         Ok(index)
     }
@@ -2449,7 +2344,8 @@ async fn list_compound_page_lookup_files(
             Ok(meta) => {
                 let file_name = meta.location.filename().unwrap_or_default();
                 // Filter files matching the pattern part_*_compound_page_data.lance
-                if file_name.starts_with("part_") && file_name.ends_with("_compound_page_data.lance")
+                if file_name.starts_with("part_")
+                    && file_name.ends_with("_compound_page_data.lance")
                 {
                     part_page_files.push(file_name.to_string());
                 }
@@ -2496,10 +2392,7 @@ fn extract_compound_partition_id(filename: &str) -> Result<u64> {
     }
 
     parts[1].parse::<u64>().map_err(|_| Error::Internal {
-        message: format!(
-            "Failed to parse partition ID from filename: {}",
-            filename
-        ),
+        message: format!("Failed to parse partition ID from filename: {}", filename),
         location: location!(),
     })
 }
@@ -2569,17 +2462,14 @@ async fn merge_compound_metadata_files(
 
     // Determine column names and data types from page schema
     let num_value_cols = arrow_schema.fields().len() - 1; // All except _rowid
-    let column_names: Vec<String> = (0..num_value_cols)
-        .map(|i| arrow_schema.field(i).name().clone())
-        .collect();
-    let data_types: Vec<DataType> = (0..num_value_cols)
-        .map(|i| arrow_schema.field(i).data_type().clone())
-        .collect();
+    let column_names: Vec<String> =
+        (0..num_value_cols).map(|i| arrow_schema.field(i).name().clone()).collect();
+    let data_types: Vec<DataType> =
+        (0..num_value_cols).map(|i| arrow_schema.field(i).data_type().clone()).collect();
 
     // Create output page file
-    let mut output_page_file = store
-        .new_index_file(COMPOUND_PAGES_NAME, arrow_schema.clone())
-        .await?;
+    let mut output_page_file =
+        store.new_index_file(COMPOUND_PAGES_NAME, arrow_schema.clone()).await?;
 
     // Merge pages and collect statistics
     let encoded_batches = merge_compound_pages(
@@ -2600,14 +2490,9 @@ async fn merge_compound_metadata_files(
     let lookup_batch = compound_stats_as_batch(encoded_batches, &column_names, &data_types)?;
 
     let mut file_schema = lookup_batch.schema().as_ref().clone();
-    file_schema.metadata.insert(
-        COMPOUND_BATCH_SIZE_META_KEY.to_string(),
-        batch_size.to_string(),
-    );
+    file_schema.metadata.insert(COMPOUND_BATCH_SIZE_META_KEY.to_string(), batch_size.to_string());
 
-    let mut lookup_file = store
-        .new_index_file(COMPOUND_LOOKUP_NAME, Arc::new(file_schema))
-        .await?;
+    let mut lookup_file = store.new_index_file(COMPOUND_LOOKUP_NAME, Arc::new(file_schema)).await?;
 
     lookup_file.write_record_batch(lookup_batch).await?;
     lookup_file.finish().await?;
@@ -2633,10 +2518,7 @@ async fn merge_compound_pages(
     let mut encoded_batches = Vec::new();
     let mut page_idx = 0u32;
 
-    debug!(
-        "Starting compound SortPreservingMerge with {} partitions",
-        part_lookup_files.len()
-    );
+    debug!("Starting compound SortPreservingMerge with {} partitions", part_lookup_files.len());
 
     let num_value_cols = column_names.len();
 
@@ -2652,13 +2534,12 @@ async fn merge_compound_pages(
     let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
     for lookup_file in part_lookup_files {
         let partition_id = extract_compound_partition_id(lookup_file)?;
-        let page_file_name = (*page_files_map.get(&partition_id).ok_or_else(|| {
-            Error::Internal {
+        let page_file_name =
+            (*page_files_map.get(&partition_id).ok_or_else(|| Error::Internal {
                 message: format!("Page file not found for partition ID: {}", partition_id),
                 location: location!(),
-            }
-        })?)
-        .clone();
+            })?)
+            .clone();
 
         let reader = store.open_index_file(&page_file_name).await?;
         let num_batches = reader.num_batches(batch_size).await;
@@ -2687,7 +2568,8 @@ async fn merge_compound_pages(
             })
             .boxed();
 
-        let sendable_stream = Box::pin(RecordBatchStreamAdapter::new(stream_schema.clone(), stream));
+        let sendable_stream =
+            Box::pin(RecordBatchStreamAdapter::new(stream_schema.clone(), stream));
         inputs.push(Arc::new(OneShotExec::new(sendable_stream)));
     }
 
@@ -2700,28 +2582,21 @@ async fn merge_compound_pages(
         let col_name = format!("col{}", i);
         sort_exprs.push(PhysicalSortExpr {
             expr: Arc::new(Column::new(&col_name, i)),
-            options: SortOptions {
-                descending: false,
-                nulls_first: true,
-            },
+            options: SortOptions { descending: false, nulls_first: true },
         });
     }
 
-    let ordering = datafusion_physical_expr::LexOrdering::new(sort_exprs).ok_or_else(|| {
-        Error::Internal {
+    let ordering =
+        datafusion_physical_expr::LexOrdering::new(sort_exprs).ok_or_else(|| Error::Internal {
             message: "Failed to create LexOrdering for compound merge".to_string(),
             location: location!(),
-        }
-    })?;
+        })?;
 
     let merge_exec = Arc::new(SortPreservingMergeExec::new(ordering, union_inputs));
 
     let unchunked = execute_plan(
         merge_exec,
-        LanceExecutionOptions {
-            use_spilling: true,
-            ..Default::default()
-        },
+        LanceExecutionOptions { use_spilling: true, ..Default::default() },
     )?;
 
     // Chunk and process
@@ -2739,10 +2614,7 @@ async fn merge_compound_pages(
         // Compute statistics for this batch
         let stats = analyze_compound_batch(&batch, num_value_cols)?;
 
-        encoded_batches.push(EncodedCompoundBatch {
-            stats,
-            page_number: page_idx,
-        });
+        encoded_batches.push(EncodedCompoundBatch { stats, page_number: page_idx });
 
         page_idx += 1;
     }
@@ -2853,14 +2725,8 @@ mod tests {
         assert_eq!(stats.len(), 2);
 
         // First column: tenant (sorted, so min="a", max="c")
-        assert_eq!(
-            stats[0].min,
-            ScalarValue::Utf8(Some("a".to_string()))
-        );
-        assert_eq!(
-            stats[0].max,
-            ScalarValue::Utf8(Some("c".to_string()))
-        );
+        assert_eq!(stats[0].min, ScalarValue::Utf8(Some("a".to_string())));
+        assert_eq!(stats[0].max, ScalarValue::Utf8(Some("c".to_string())));
         assert_eq!(stats[0].null_count, 0);
 
         // Second column: count
@@ -2912,9 +2778,8 @@ mod tests {
                 Field::new("status", DataType::Utf8, false),
             ])),
             vec![
-                Arc::new(StringArray::from(vec![
-                    "acme", "acme", "acme", "beta", "beta", "gamma",
-                ])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["acme", "acme", "acme", "beta", "beta", "gamma"]))
+                    as ArrayRef,
                 Arc::new(StringArray::from(vec![
                     "active", "active", "inactive", "active", "inactive", "active",
                 ])) as ArrayRef,
@@ -2927,14 +2792,8 @@ mod tests {
         assert_eq!(stats.len(), 2);
 
         // First column: tenant_id - sorted, so min="acme", max="gamma"
-        assert_eq!(
-            stats[0].min,
-            ScalarValue::Utf8(Some("acme".to_string()))
-        );
-        assert_eq!(
-            stats[0].max,
-            ScalarValue::Utf8(Some("gamma".to_string()))
-        );
+        assert_eq!(stats[0].min, ScalarValue::Utf8(Some("acme".to_string())));
+        assert_eq!(stats[0].max, ScalarValue::Utf8(Some("gamma".to_string())));
 
         // Second column: status - NOT sorted, must scan all rows
         // "active" < "inactive" lexicographically, so min="active", max="inactive"
@@ -3109,11 +2968,7 @@ mod tests {
 
         assert_eq!(remapped.num_rows(), 3); // Row 200 was deleted
 
-        let row_ids = remapped
-            .column(2)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .unwrap();
+        let row_ids = remapped.column(2).as_any().downcast_ref::<UInt64Array>().unwrap();
         assert_eq!(row_ids.value(0), 1000);
         assert_eq!(row_ids.value(1), 3000);
         assert_eq!(row_ids.value(2), 400); // Unchanged
@@ -3138,26 +2993,14 @@ mod tests {
     fn test_compound_btree_lookup_new() {
         let page_stats = vec![
             CompoundPageStats {
-                mins: vec![
-                    ScalarValue::Utf8(Some("a".to_string())),
-                    ScalarValue::Int64(Some(1)),
-                ],
-                maxs: vec![
-                    ScalarValue::Utf8(Some("c".to_string())),
-                    ScalarValue::Int64(Some(100)),
-                ],
+                mins: vec![ScalarValue::Utf8(Some("a".to_string())), ScalarValue::Int64(Some(1))],
+                maxs: vec![ScalarValue::Utf8(Some("c".to_string())), ScalarValue::Int64(Some(100))],
                 null_counts: vec![0, 0],
                 page_number: 0,
             },
             CompoundPageStats {
-                mins: vec![
-                    ScalarValue::Utf8(Some("d".to_string())),
-                    ScalarValue::Int64(Some(101)),
-                ],
-                maxs: vec![
-                    ScalarValue::Utf8(Some("f".to_string())),
-                    ScalarValue::Int64(Some(200)),
-                ],
+                mins: vec![ScalarValue::Utf8(Some("d".to_string())), ScalarValue::Int64(Some(101))],
+                maxs: vec![ScalarValue::Utf8(Some("f".to_string())), ScalarValue::Int64(Some(200))],
                 null_counts: vec![1, 2],
                 page_number: 1,
             },
@@ -3211,26 +3054,14 @@ mod tests {
 
         let page_stats = vec![
             CompoundPageStats {
-                mins: vec![
-                    ScalarValue::Utf8(Some("a".to_string())),
-                    ScalarValue::Int64(Some(1)),
-                ],
-                maxs: vec![
-                    ScalarValue::Utf8(Some("c".to_string())),
-                    ScalarValue::Int64(Some(100)),
-                ],
+                mins: vec![ScalarValue::Utf8(Some("a".to_string())), ScalarValue::Int64(Some(1))],
+                maxs: vec![ScalarValue::Utf8(Some("c".to_string())), ScalarValue::Int64(Some(100))],
                 null_counts: vec![0, 0],
                 page_number: 0,
             },
             CompoundPageStats {
-                mins: vec![
-                    ScalarValue::Utf8(Some("d".to_string())),
-                    ScalarValue::Int64(Some(101)),
-                ],
-                maxs: vec![
-                    ScalarValue::Utf8(Some("f".to_string())),
-                    ScalarValue::Int64(Some(200)),
-                ],
+                mins: vec![ScalarValue::Utf8(Some("d".to_string())), ScalarValue::Int64(Some(101))],
+                maxs: vec![ScalarValue::Utf8(Some("f".to_string())), ScalarValue::Int64(Some(200))],
                 null_counts: vec![0, 0],
                 page_number: 1,
             },
@@ -3239,30 +3070,26 @@ mod tests {
         let lookup = CompoundBTreeLookup::new(page_stats, vec![DataType::Utf8, DataType::Int64]);
 
         // Query for tenant_id = "b" - should match page 0 only
-        let query = CompoundSargableQuery::prefix_lookup(vec![
-            ScalarValue::Utf8(Some("b".to_string())),
-        ]);
+        let query =
+            CompoundSargableQuery::prefix_lookup(vec![ScalarValue::Utf8(Some("b".to_string()))]);
         let pages = lookup.find_candidate_pages(&query);
         assert_eq!(pages, vec![0]);
 
         // Query for tenant_id = "e" - should match page 1 only
-        let query = CompoundSargableQuery::prefix_lookup(vec![
-            ScalarValue::Utf8(Some("e".to_string())),
-        ]);
+        let query =
+            CompoundSargableQuery::prefix_lookup(vec![ScalarValue::Utf8(Some("e".to_string()))]);
         let pages = lookup.find_candidate_pages(&query);
         assert_eq!(pages, vec![1]);
 
         // Query for tenant_id = "z" - should match no pages
-        let query = CompoundSargableQuery::prefix_lookup(vec![
-            ScalarValue::Utf8(Some("z".to_string())),
-        ]);
+        let query =
+            CompoundSargableQuery::prefix_lookup(vec![ScalarValue::Utf8(Some("z".to_string()))]);
         let pages = lookup.find_candidate_pages(&query);
         assert!(pages.is_empty());
 
         // Query for tenant_id = "a" - should match page 0 (boundary case)
-        let query = CompoundSargableQuery::prefix_lookup(vec![
-            ScalarValue::Utf8(Some("a".to_string())),
-        ]);
+        let query =
+            CompoundSargableQuery::prefix_lookup(vec![ScalarValue::Utf8(Some("a".to_string()))]);
         let pages = lookup.find_candidate_pages(&query);
         assert_eq!(pages, vec![0]);
     }
@@ -3274,26 +3101,14 @@ mod tests {
 
         let page_stats = vec![
             CompoundPageStats {
-                mins: vec![
-                    ScalarValue::Utf8(Some("a".to_string())),
-                    ScalarValue::Int64(Some(1)),
-                ],
-                maxs: vec![
-                    ScalarValue::Utf8(Some("a".to_string())),
-                    ScalarValue::Int64(Some(100)),
-                ],
+                mins: vec![ScalarValue::Utf8(Some("a".to_string())), ScalarValue::Int64(Some(1))],
+                maxs: vec![ScalarValue::Utf8(Some("a".to_string())), ScalarValue::Int64(Some(100))],
                 null_counts: vec![0, 0],
                 page_number: 0,
             },
             CompoundPageStats {
-                mins: vec![
-                    ScalarValue::Utf8(Some("a".to_string())),
-                    ScalarValue::Int64(Some(101)),
-                ],
-                maxs: vec![
-                    ScalarValue::Utf8(Some("a".to_string())),
-                    ScalarValue::Int64(Some(200)),
-                ],
+                mins: vec![ScalarValue::Utf8(Some("a".to_string())), ScalarValue::Int64(Some(101))],
+                maxs: vec![ScalarValue::Utf8(Some("a".to_string())), ScalarValue::Int64(Some(200))],
                 null_counts: vec![0, 0],
                 page_number: 1,
             },
@@ -3305,10 +3120,7 @@ mod tests {
         // Should match page 0 (50 < 100) and page 1 (timestamp range 101-200 > 50)
         let query = CompoundSargableQuery::prefix_lookup_with_range(
             vec![ScalarValue::Utf8(Some("a".to_string()))],
-            (
-                Bound::Excluded(ScalarValue::Int64(Some(50))),
-                Bound::Unbounded,
-            ),
+            (Bound::Excluded(ScalarValue::Int64(Some(50))), Bound::Unbounded),
         );
         let pages = lookup.find_candidate_pages(&query);
         assert_eq!(pages, vec![0, 1]);
@@ -3317,10 +3129,7 @@ mod tests {
         // Should match only page 1 (101-200 includes values > 150)
         let query = CompoundSargableQuery::prefix_lookup_with_range(
             vec![ScalarValue::Utf8(Some("a".to_string()))],
-            (
-                Bound::Excluded(ScalarValue::Int64(Some(150))),
-                Bound::Unbounded,
-            ),
+            (Bound::Excluded(ScalarValue::Int64(Some(150))), Bound::Unbounded),
         );
         let pages = lookup.find_candidate_pages(&query);
         assert_eq!(pages, vec![1]);
@@ -3329,10 +3138,7 @@ mod tests {
         // Should match only page 0 (1-100 includes values < 50)
         let query = CompoundSargableQuery::prefix_lookup_with_range(
             vec![ScalarValue::Utf8(Some("a".to_string()))],
-            (
-                Bound::Unbounded,
-                Bound::Excluded(ScalarValue::Int64(Some(50))),
-            ),
+            (Bound::Unbounded, Bound::Excluded(ScalarValue::Int64(Some(50)))),
         );
         let pages = lookup.find_candidate_pages(&query);
         assert_eq!(pages, vec![0]);
@@ -3344,26 +3150,14 @@ mod tests {
 
         let page_stats = vec![
             CompoundPageStats {
-                mins: vec![
-                    ScalarValue::Utf8(Some("a".to_string())),
-                    ScalarValue::Int64(Some(1)),
-                ],
-                maxs: vec![
-                    ScalarValue::Utf8(Some("c".to_string())),
-                    ScalarValue::Int64(Some(100)),
-                ],
+                mins: vec![ScalarValue::Utf8(Some("a".to_string())), ScalarValue::Int64(Some(1))],
+                maxs: vec![ScalarValue::Utf8(Some("c".to_string())), ScalarValue::Int64(Some(100))],
                 null_counts: vec![5, 0], // 5 nulls in tenant column
                 page_number: 0,
             },
             CompoundPageStats {
-                mins: vec![
-                    ScalarValue::Utf8(Some("d".to_string())),
-                    ScalarValue::Int64(Some(101)),
-                ],
-                maxs: vec![
-                    ScalarValue::Utf8(Some("f".to_string())),
-                    ScalarValue::Int64(Some(200)),
-                ],
+                mins: vec![ScalarValue::Utf8(Some("d".to_string())), ScalarValue::Int64(Some(101))],
+                maxs: vec![ScalarValue::Utf8(Some("f".to_string())), ScalarValue::Int64(Some(200))],
                 null_counts: vec![0, 0], // No nulls
                 page_number: 1,
             },
@@ -3393,9 +3187,8 @@ mod tests {
 
         // Any query should return empty pages
         use super::super::compound::CompoundSargableQuery;
-        let query = CompoundSargableQuery::prefix_lookup(vec![
-            ScalarValue::Utf8(Some("test".to_string())),
-        ]);
+        let query =
+            CompoundSargableQuery::prefix_lookup(vec![ScalarValue::Utf8(Some("test".to_string()))]);
         let pages = lookup.find_candidate_pages(&query);
         assert!(pages.is_empty());
     }
@@ -3543,7 +3336,8 @@ mod tests {
         batches: Vec<RecordBatch>,
         schema: Arc<Schema>,
     ) -> SendableRecordBatchStream {
-        let stream = stream::iter(batches.into_iter().map(Ok::<_, datafusion_common::DataFusionError>));
+        let stream =
+            stream::iter(batches.into_iter().map(Ok::<_, datafusion_common::DataFusionError>));
         Box::pin(DFRecordBatchStreamAdapter::new(schema, stream))
     }
 
@@ -3566,21 +3360,15 @@ mod tests {
 
         let column_names = vec!["tenant".to_string(), "status".to_string()];
         let data_types = vec![DataType::Utf8, DataType::Utf8];
-        let compound_schema = CompoundIndexSchema::new(column_names.clone(), data_types.clone()).unwrap();
+        let compound_schema =
+            CompoundIndexSchema::new(column_names.clone(), data_types.clone()).unwrap();
         let sub_index = CompoundFlatIndexMetadata::new(column_names.clone(), data_types.clone());
 
         let stream = batches_to_stream(vec![initial_batch], sub_index.schema().clone());
 
-        train_compound_btree_index(
-            stream,
-            &sub_index,
-            store.as_ref(),
-            &compound_schema,
-            100,
-            None,
-        )
-        .await
-        .unwrap();
+        train_compound_btree_index(stream, &sub_index, store.as_ref(), &compound_schema, 100, None)
+            .await
+            .unwrap();
 
         // Load the index
         let index = CompoundBTreeIndex::load(
@@ -3612,10 +3400,7 @@ mod tests {
         ));
 
         // Perform the update
-        index
-            .update(new_stream, update_store.as_ref())
-            .await
-            .unwrap();
+        index.update(new_stream, update_store.as_ref()).await.unwrap();
 
         // Load the updated index
         let updated_index = CompoundBTreeIndex::load(
@@ -3654,21 +3439,15 @@ mod tests {
 
         let column_names = vec!["tenant".to_string(), "status".to_string()];
         let data_types = vec![DataType::Utf8, DataType::Utf8];
-        let compound_schema = CompoundIndexSchema::new(column_names.clone(), data_types.clone()).unwrap();
+        let compound_schema =
+            CompoundIndexSchema::new(column_names.clone(), data_types.clone()).unwrap();
         let sub_index = CompoundFlatIndexMetadata::new(column_names.clone(), data_types.clone());
 
         let stream = batches_to_stream(vec![initial_batch], sub_index.schema().clone());
 
-        train_compound_btree_index(
-            stream,
-            &sub_index,
-            store.as_ref(),
-            &compound_schema,
-            100,
-            None,
-        )
-        .await
-        .unwrap();
+        train_compound_btree_index(stream, &sub_index, store.as_ref(), &compound_schema, 100, None)
+            .await
+            .unwrap();
 
         let index = CompoundBTreeIndex::load(
             store.clone(),
@@ -3681,8 +3460,8 @@ mod tests {
 
         // Create remap that deletes row 2 and 3
         let mut mapping = HashMap::new();
-        mapping.insert(2u64, None);  // Delete row 2
-        mapping.insert(3u64, None);  // Delete row 3
+        mapping.insert(2u64, None); // Delete row 2
+        mapping.insert(3u64, None); // Delete row 3
 
         // Create new store for remapped index
         let remap_dir = TempObjDir::default();
@@ -3732,29 +3511,20 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        let initial_batch = create_sorted_test_batch(
-            vec!["a", "b", "c"],
-            vec!["x", "y", "z"],
-            vec![10, 20, 30],
-        );
+        let initial_batch =
+            create_sorted_test_batch(vec!["a", "b", "c"], vec!["x", "y", "z"], vec![10, 20, 30]);
 
         let column_names = vec!["col1".to_string(), "col2".to_string()];
         let data_types = vec![DataType::Utf8, DataType::Utf8];
-        let compound_schema = CompoundIndexSchema::new(column_names.clone(), data_types.clone()).unwrap();
+        let compound_schema =
+            CompoundIndexSchema::new(column_names.clone(), data_types.clone()).unwrap();
         let sub_index = CompoundFlatIndexMetadata::new(column_names.clone(), data_types.clone());
 
         let stream = batches_to_stream(vec![initial_batch], sub_index.schema().clone());
 
-        train_compound_btree_index(
-            stream,
-            &sub_index,
-            store.as_ref(),
-            &compound_schema,
-            100,
-            None,
-        )
-        .await
-        .unwrap();
+        train_compound_btree_index(stream, &sub_index, store.as_ref(), &compound_schema, 100, None)
+            .await
+            .unwrap();
 
         let index = CompoundBTreeIndex::load(
             store.clone(),
@@ -3787,5 +3557,527 @@ mod tests {
         let remapped_data = remapped_reader.read_record_batch(0, 100).await.unwrap();
 
         assert_eq!(original_data, remapped_data);
+    }
+
+    #[tokio::test]
+    async fn test_compound_index_update_with_new_fragments() {
+        // Test that update correctly merges data from new fragments (disjoint row IDs)
+        // This simulates the real-world scenario where new data comes from new fragments
+        // which always have disjoint row IDs from existing indexed fragments.
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Initial data with sorted compound keys (simulating fragment 0)
+        let initial_batch = create_sorted_test_batch(
+            vec!["a", "b", "c", "d"],
+            vec!["active", "active", "inactive", "active"],
+            vec![1, 2, 3, 4],
+        );
+
+        let column_names = vec!["tenant".to_string(), "status".to_string()];
+        let data_types = vec![DataType::Utf8, DataType::Utf8];
+        let compound_schema =
+            CompoundIndexSchema::new(column_names.clone(), data_types.clone()).unwrap();
+        let sub_index = CompoundFlatIndexMetadata::new(column_names.clone(), data_types.clone());
+
+        let stream = batches_to_stream(vec![initial_batch], sub_index.schema().clone());
+
+        train_compound_btree_index(stream, &sub_index, store.as_ref(), &compound_schema, 100, None)
+            .await
+            .unwrap();
+
+        let index = CompoundBTreeIndex::load(
+            store.clone(),
+            column_names.clone(),
+            None,
+            &LanceCache::no_cache(),
+        )
+        .await
+        .unwrap();
+
+        // New data from a new fragment (disjoint row IDs: 5, 6)
+        // These values interleave with existing data when sorted
+        let new_batch = create_sorted_test_batch(
+            vec!["a", "e"], // "a" sorts before existing "b", "e" sorts after "d"
+            vec!["inactive", "inactive"],
+            vec![5, 6], // New row IDs from new fragment
+        );
+
+        let new_stream = batches_to_stream(vec![new_batch], sub_index.schema().clone());
+
+        let update_dir = TempObjDir::default();
+        let update_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            update_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Perform update
+        index.update(new_stream, update_store.as_ref()).await.unwrap();
+
+        // Load updated index
+        let updated_index = CompoundBTreeIndex::load(
+            update_store.clone(),
+            column_names.clone(),
+            None,
+            &LanceCache::no_cache(),
+        )
+        .await
+        .unwrap();
+
+        // Verify the index merged old and new data correctly
+        let page_reader = update_store.open_index_file(COMPOUND_PAGES_NAME).await.unwrap();
+        let all_data = page_reader.read_record_batch(0, 100).await.unwrap();
+
+        // Should have 6 rows: 4 original + 2 new
+        assert_eq!(all_data.num_rows(), 6);
+
+        // Verify data is sorted by compound key
+        let tenant_col = all_data.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let status_col = all_data.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let row_ids = all_data
+            .column_by_name(COMPOUND_IDS_COLUMN)
+            .unwrap()
+            .as_primitive::<arrow_array::types::UInt64Type>();
+
+        // Expected order after merge and sort:
+        // ("a", "active", 1) - original
+        // ("a", "inactive", 5) - new (sorts after "a","active")
+        // ("b", "active", 2) - original
+        // ("c", "inactive", 3) - original
+        // ("d", "active", 4) - original
+        // ("e", "inactive", 6) - new
+        assert_eq!(tenant_col.value(0), "a");
+        assert_eq!(status_col.value(0), "active");
+        assert_eq!(row_ids.value(0), 1);
+
+        assert_eq!(tenant_col.value(1), "a");
+        assert_eq!(status_col.value(1), "inactive");
+        assert_eq!(row_ids.value(1), 5);
+
+        assert_eq!(tenant_col.value(2), "b");
+        assert_eq!(status_col.value(2), "active");
+        assert_eq!(row_ids.value(2), 2);
+
+        assert_eq!(tenant_col.value(3), "c");
+        assert_eq!(status_col.value(3), "inactive");
+        assert_eq!(row_ids.value(3), 3);
+
+        assert_eq!(tenant_col.value(4), "d");
+        assert_eq!(status_col.value(4), "active");
+        assert_eq!(row_ids.value(4), 4);
+
+        assert_eq!(tenant_col.value(5), "e");
+        assert_eq!(status_col.value(5), "inactive");
+        assert_eq!(row_ids.value(5), 6);
+
+        // Test query on updated index
+        use super::super::compound::CompoundSargableQuery;
+        use crate::metrics::NoOpMetricsCollector;
+        use crate::scalar::{AnyQuery, ScalarIndex};
+        use datafusion_common::ScalarValue;
+
+        let query = CompoundSargableQuery::PrefixLookup {
+            prefix: vec![
+                ScalarValue::Utf8(Some("a".to_string())),
+                ScalarValue::Utf8(Some("inactive".to_string())),
+            ],
+            range: None,
+        };
+
+        let result =
+            updated_index.search(&query as &dyn AnyQuery, &NoOpMetricsCollector).await.unwrap();
+
+        let found_row_ids: Vec<u64> = result
+            .row_addrs()
+            .true_rows()
+            .row_addrs()
+            .map(|iter| iter.map(u64::from).collect())
+            .unwrap_or_default();
+
+        // Should find the new row 5 with ("a", "inactive")
+        assert_eq!(found_row_ids, vec![5]);
+    }
+
+    #[tokio::test]
+    async fn test_compound_index_update_interleaved_values() {
+        // Test that update correctly interleaves new data with existing data when sorted
+        // This simulates adding new fragments with values that sort between existing values
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Initial data: 3 tenants, each with 2 statuses (6 rows, row IDs 1-6)
+        let initial_batch = create_sorted_test_batch(
+            vec!["acme", "acme", "beta", "beta", "gamma", "gamma"],
+            vec!["active", "inactive", "active", "inactive", "active", "inactive"],
+            vec![1, 2, 3, 4, 5, 6],
+        );
+
+        let column_names = vec!["tenant".to_string(), "status".to_string()];
+        let data_types = vec![DataType::Utf8, DataType::Utf8];
+        let compound_schema =
+            CompoundIndexSchema::new(column_names.clone(), data_types.clone()).unwrap();
+        let sub_index = CompoundFlatIndexMetadata::new(column_names.clone(), data_types.clone());
+
+        let stream = batches_to_stream(vec![initial_batch], sub_index.schema().clone());
+
+        train_compound_btree_index(stream, &sub_index, store.as_ref(), &compound_schema, 100, None)
+            .await
+            .unwrap();
+
+        let index = CompoundBTreeIndex::load(
+            store.clone(),
+            column_names.clone(),
+            None,
+            &LanceCache::no_cache(),
+        )
+        .await
+        .unwrap();
+
+        // New data from new fragment (row IDs 7-8) that interleaves with existing data
+        // "delta" sorts between "beta" and "gamma"
+        // Adding another "beta","active" to test duplicate compound keys with different row IDs
+        let new_batch = create_sorted_test_batch(
+            vec!["beta", "delta"], // Sorted order
+            vec!["active", "inactive"],
+            vec![7, 8], // New row IDs from new fragment
+        );
+
+        let new_stream = batches_to_stream(vec![new_batch], sub_index.schema().clone());
+
+        let update_dir = TempObjDir::default();
+        let update_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            update_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        index.update(new_stream, update_store.as_ref()).await.unwrap();
+
+        let updated_index = CompoundBTreeIndex::load(
+            update_store.clone(),
+            column_names.clone(),
+            None,
+            &LanceCache::no_cache(),
+        )
+        .await
+        .unwrap();
+
+        // Verify merged data
+        let page_reader = update_store.open_index_file(COMPOUND_PAGES_NAME).await.unwrap();
+        let all_data = page_reader.read_record_batch(0, 100).await.unwrap();
+
+        // Should have 8 rows: 6 original + 2 new
+        assert_eq!(all_data.num_rows(), 8);
+
+        let _tenant_col = all_data.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let _status_col = all_data.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let _row_ids = all_data
+            .column_by_name(COMPOUND_IDS_COLUMN)
+            .unwrap()
+            .as_primitive::<arrow_array::types::UInt64Type>();
+
+        // Expected order after merge (sorted by compound key):
+        // ("acme", "active", 1)
+        // ("acme", "inactive", 2)
+        // ("beta", "active", 3)
+        // ("beta", "active", 7) - new, same compound key as row 3
+        // ("beta", "inactive", 4)
+        // ("delta", "inactive", 8) - new, sorts between beta and gamma
+        // ("gamma", "active", 5)
+        // ("gamma", "inactive", 6)
+
+        // Test query for "delta" tenant - should find the new row
+        use super::super::compound::CompoundSargableQuery;
+        use crate::metrics::NoOpMetricsCollector;
+        use crate::scalar::{AnyQuery, ScalarIndex};
+        use datafusion_common::ScalarValue;
+
+        let query_delta = CompoundSargableQuery::PrefixLookup {
+            prefix: vec![
+                ScalarValue::Utf8(Some("delta".to_string())),
+                ScalarValue::Utf8(Some("inactive".to_string())),
+            ],
+            range: None,
+        };
+
+        let result_delta = updated_index
+            .search(&query_delta as &dyn AnyQuery, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        let found_delta: Vec<u64> = result_delta
+            .row_addrs()
+            .true_rows()
+            .row_addrs()
+            .map(|iter| iter.map(u64::from).collect())
+            .unwrap_or_default();
+
+        assert_eq!(found_delta, vec![8], "Should find new row 8 under 'delta'");
+
+        // Test query for ("beta", "active") - should find 2 rows (original + new)
+        let query_beta_active = CompoundSargableQuery::PrefixLookup {
+            prefix: vec![
+                ScalarValue::Utf8(Some("beta".to_string())),
+                ScalarValue::Utf8(Some("active".to_string())),
+            ],
+            range: None,
+        };
+
+        let result_beta = updated_index
+            .search(&query_beta_active as &dyn AnyQuery, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        let found_beta: Vec<u64> = result_beta
+            .row_addrs()
+            .true_rows()
+            .row_addrs()
+            .map(|iter| iter.map(u64::from).collect())
+            .unwrap_or_default();
+
+        assert_eq!(found_beta.len(), 2, "Should find 2 rows with (beta, active)");
+        assert!(found_beta.contains(&3), "Should include original row 3");
+        assert!(found_beta.contains(&7), "Should include new row 7");
+
+        // Test prefix query for just "beta" tenant - should find 3 rows
+        let query_beta_prefix = CompoundSargableQuery::PrefixLookup {
+            prefix: vec![ScalarValue::Utf8(Some("beta".to_string()))],
+            range: None,
+        };
+
+        let result_beta_prefix = updated_index
+            .search(&query_beta_prefix as &dyn AnyQuery, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        let found_beta_prefix: Vec<u64> = result_beta_prefix
+            .row_addrs()
+            .true_rows()
+            .row_addrs()
+            .map(|iter| iter.map(u64::from).collect())
+            .unwrap_or_default();
+
+        assert_eq!(
+            found_beta_prefix.len(),
+            3,
+            "Should find 3 rows with tenant 'beta'"
+        );
+        assert!(found_beta_prefix.contains(&3), "Should include row 3");
+        assert!(found_beta_prefix.contains(&4), "Should include row 4");
+        assert!(found_beta_prefix.contains(&7), "Should include new row 7");
+    }
+
+    #[tokio::test]
+    async fn test_compound_index_page_stats_after_update() {
+        // Test that page statistics are correctly maintained after updates
+        // and that pruning still works correctly
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Create initial data that will span multiple pages
+        // Page size is 10, so we'll create 25 rows to get 3 pages
+        let mut tenant_ids = Vec::new();
+        let mut statuses = Vec::new();
+        let mut row_ids = Vec::new();
+
+        // Page 1: rows 1-10, tenants a-j
+        for i in 0..10 {
+            tenant_ids.push(format!("{}", (b'a' + i as u8) as char));
+            statuses.push("active");
+            row_ids.push(i + 1);
+        }
+
+        // Page 2: rows 11-20, tenants k-t
+        for i in 0..10 {
+            tenant_ids.push(format!("{}", (b'k' + i as u8) as char));
+            statuses.push("inactive");
+            row_ids.push(i + 11);
+        }
+
+        // Page 3: rows 21-25, tenants u-y
+        for i in 0..5 {
+            tenant_ids.push(format!("{}", (b'u' + i as u8) as char));
+            statuses.push("active");
+            row_ids.push(i + 21);
+        }
+
+        let initial_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("col0", DataType::Utf8, true),
+                Field::new("col1", DataType::Utf8, true),
+                Field::new(COMPOUND_IDS_COLUMN, DataType::UInt64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(
+                    tenant_ids.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                Arc::new(StringArray::from(statuses)) as ArrayRef,
+                Arc::new(UInt64Array::from(row_ids)) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let column_names = vec!["tenant".to_string(), "status".to_string()];
+        let data_types = vec![DataType::Utf8, DataType::Utf8];
+        let compound_schema =
+            CompoundIndexSchema::new(column_names.clone(), data_types.clone()).unwrap();
+        let sub_index = CompoundFlatIndexMetadata::new(column_names.clone(), data_types.clone());
+
+        let stream = batches_to_stream(vec![initial_batch], sub_index.schema().clone());
+
+        train_compound_btree_index(
+            stream,
+            &sub_index,
+            store.as_ref(),
+            &compound_schema,
+            10, // Page size of 10
+            None,
+        )
+        .await
+        .unwrap();
+
+        let index = CompoundBTreeIndex::load(
+            store.clone(),
+            column_names.clone(),
+            None,
+            &LanceCache::no_cache(),
+        )
+        .await
+        .unwrap();
+
+        // Verify we have 3 pages
+        assert_eq!(index.num_pages(), 3);
+
+        // Add new data that extends beyond the original bounds
+        // Add rows with tenant "z" (beyond page 3's max of "y")
+        // and tenant "0" (before page 1's min of "a")
+        let new_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("col0", DataType::Utf8, true),
+                Field::new("col1", DataType::Utf8, true),
+                Field::new(COMPOUND_IDS_COLUMN, DataType::UInt64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["0", "z"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["active", "active"])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![26, 27])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let new_stream = batches_to_stream(vec![new_batch], sub_index.schema().clone());
+
+        let update_dir = TempObjDir::default();
+        let update_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            update_dir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        index.update(new_stream, update_store.as_ref()).await.unwrap();
+
+        let updated_index = CompoundBTreeIndex::load(
+            update_store.clone(),
+            column_names.clone(),
+            None,
+            &LanceCache::no_cache(),
+        )
+        .await
+        .unwrap();
+
+        // After update, we should have 3 pages (27 rows, page size 10 = 3 pages)
+        assert_eq!(updated_index.num_pages(), 3);
+
+        // Test pruning: query for tenant "0" should only scan relevant pages
+        use super::super::compound::CompoundSargableQuery;
+        use crate::metrics::NoOpMetricsCollector;
+        use crate::scalar::{AnyQuery, ScalarIndex};
+        use datafusion_common::ScalarValue;
+
+        let query_0 = CompoundSargableQuery::PrefixLookup {
+            prefix: vec![ScalarValue::Utf8(Some("0".to_string()))],
+            range: None,
+        };
+
+        let result_0 =
+            updated_index.search(&query_0 as &dyn AnyQuery, &NoOpMetricsCollector).await.unwrap();
+
+        let found_0: Vec<u64> = result_0
+            .row_addrs()
+            .true_rows()
+            .row_addrs()
+            .map(|iter| iter.map(u64::from).collect())
+            .unwrap_or_default();
+
+        assert_eq!(found_0, vec![26], "Should find row 26 with tenant '0'");
+
+        // Test pruning: query for tenant "z" should only scan relevant pages
+        let query_z = CompoundSargableQuery::PrefixLookup {
+            prefix: vec![ScalarValue::Utf8(Some("z".to_string()))],
+            range: None,
+        };
+
+        let result_z =
+            updated_index.search(&query_z as &dyn AnyQuery, &NoOpMetricsCollector).await.unwrap();
+
+        let found_z: Vec<u64> = result_z
+            .row_addrs()
+            .true_rows()
+            .row_addrs()
+            .map(|iter| iter.map(u64::from).collect())
+            .unwrap_or_default();
+
+        assert_eq!(found_z, vec![27], "Should find row 27 with tenant 'z'");
+
+        // Test pruning: query for tenant "m" (middle of original range) should still work
+        let query_m = CompoundSargableQuery::PrefixLookup {
+            prefix: vec![ScalarValue::Utf8(Some("m".to_string()))],
+            range: None,
+        };
+
+        let result_m =
+            updated_index.search(&query_m as &dyn AnyQuery, &NoOpMetricsCollector).await.unwrap();
+
+        let found_m: Vec<u64> = result_m
+            .row_addrs()
+            .true_rows()
+            .row_addrs()
+            .map(|iter| iter.map(u64::from).collect())
+            .unwrap_or_default();
+
+        assert_eq!(found_m, vec![13], "Should find row 13 with tenant 'm'");
+
+        // Verify global bounds are updated for first column (tenant)
+        let tenant_bounds = updated_index.global_bounds(0);
+        assert!(tenant_bounds.is_some(), "Should have bounds for tenant column");
+
+        let (min_tenant, max_tenant, _) = tenant_bounds.unwrap();
+        assert_eq!(
+            min_tenant,
+            ScalarValue::Utf8(Some("0".to_string())),
+            "Min tenant should be '0'"
+        );
+        assert_eq!(
+            max_tenant,
+            ScalarValue::Utf8(Some("z".to_string())),
+            "Max tenant should be 'z'"
+        );
+
+        // Verify second column (status) bounds exist
+        let status_bounds = updated_index.global_bounds(1);
+        assert!(status_bounds.is_some(), "Should have bounds for status column");
     }
 }

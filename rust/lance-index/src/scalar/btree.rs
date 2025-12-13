@@ -1324,10 +1324,7 @@ impl BTreeIndex {
     /// which uses parallel I/O for higher throughput.
     pub async fn into_sorted_data_stream(self) -> Result<SendableRecordBatchStream> {
         let reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
-        let schema = self.sub_index.schema().clone();
-        let value_field = schema.field(0).clone().with_name(VALUE_COLUMN_NAME);
-        let row_id_field = schema.field(1).clone().with_name(ROW_ID);
-        let new_schema = Arc::new(Schema::new(vec![value_field, row_id_field]));
+        let new_schema = Arc::new(self.train_schema());
         let new_schema_clone = new_schema.clone();
 
         // Collect page numbers in sorted order by iterating the BTreeMap
@@ -1415,10 +1412,7 @@ impl BTreeIndex {
     /// the BTreeMap in reverse order to produce descending results.
     pub async fn into_reverse_sorted_data_stream(self) -> Result<SendableRecordBatchStream> {
         let reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
-        let schema = self.sub_index.schema().clone();
-        let value_field = schema.field(0).clone().with_name(VALUE_COLUMN_NAME);
-        let row_id_field = schema.field(1).clone().with_name(ROW_ID);
-        let new_schema = Arc::new(Schema::new(vec![value_field, row_id_field]));
+        let new_schema = Arc::new(self.train_schema());
         let new_schema_clone = new_schema.clone();
 
         // Collect page numbers in reverse sorted order by iterating the BTreeMap backwards

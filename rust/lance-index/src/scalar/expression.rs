@@ -19,8 +19,8 @@ use datafusion_expr::{
 use tokio::try_join;
 
 use super::{
-    AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
-    SearchResult, TextQuery, TokenQuery,
+    compound::CompoundSargableQuery, AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector,
+    SargableQuery, ScalarIndex, SearchResult, TextQuery, TokenQuery,
 };
 use lance_core::{
     utils::mask::{NullableRowIdMask, RowIdMask},
@@ -1454,11 +1454,97 @@ fn maybe_range(
     parser.visit_between(&left_col, &low, &high)
 }
 
+/// Recursively collect equality predicates from an AND expression tree.
+///
+/// Returns a vector of (column_name, value) pairs for all `col = value` predicates.
+fn collect_equality_predicates(expr: &Expr) -> Vec<(String, ScalarValue)> {
+    match expr {
+        Expr::BinaryExpr(binary) => match binary.op {
+            Operator::And => {
+                let mut predicates = collect_equality_predicates(&binary.left);
+                predicates.extend(collect_equality_predicates(&binary.right));
+                predicates
+            }
+            Operator::Eq => {
+                // Try to extract column = value (either order)
+                if let Some(col) = maybe_column(&binary.left) {
+                    if let Expr::Literal(value, _) = binary.right.as_ref() {
+                        return vec![(col.to_string(), value.clone())];
+                    }
+                }
+                if let Some(col) = maybe_column(&binary.right) {
+                    if let Expr::Literal(value, _) = binary.left.as_ref() {
+                        return vec![(col.to_string(), value.clone())];
+                    }
+                }
+                vec![]
+            }
+            _ => vec![],
+        },
+        _ => vec![],
+    }
+}
+
+/// Check if an AND expression can be satisfied by a compound index prefix lookup.
+///
+/// This function looks for patterns like `col1 = a AND col2 = b` where the columns
+/// form a prefix of a compound index.
+fn maybe_compound_prefix(
+    expr: &BinaryExpr,
+    index_info: &dyn IndexInformationProvider,
+) -> Option<IndexedExpression> {
+    // Collect all equality predicates from the AND tree
+    let full_expr = Expr::BinaryExpr(expr.clone());
+    let predicates = collect_equality_predicates(&full_expr);
+
+    if predicates.is_empty() {
+        return None;
+    }
+
+    // Extract column names
+    let cols: Vec<&str> = predicates.iter().map(|(c, _)| c.as_str()).collect();
+
+    // Check if a compound index covers these columns as a prefix
+    let compound_info = index_info.get_compound_index(&cols)?;
+
+    // Build values in index column order
+    let mut prefix_values = Vec::with_capacity(cols.len());
+    for col_name in compound_info.columns {
+        if let Some((_, val)) = predicates.iter().find(|(c, _)| c == col_name) {
+            prefix_values.push(val.clone());
+        } else {
+            // Stop at first missing column (can't skip columns in prefix)
+            break;
+        }
+    }
+
+    if prefix_values.is_empty() {
+        return None;
+    }
+
+    // Create the compound query
+    let query = CompoundSargableQuery::prefix_lookup(prefix_values);
+
+    // Use the first column name as the "column" for the indexed expression
+    // (this is used for tracking purposes, the actual query uses all columns)
+    Some(IndexedExpression::index_query(
+        compound_info.columns[0].clone(),
+        compound_info.index_name.to_string(),
+        Arc::new(query),
+    ))
+}
+
 fn visit_and(
     expr: &BinaryExpr,
     index_info: &dyn IndexInformationProvider,
     depth: usize,
 ) -> Result<Option<IndexedExpression>> {
+    // Check for compound index prefix pattern first
+    // This handles queries like "tenant_id = 'acme' AND status = 'active'"
+    if let Some(compound_expr) = maybe_compound_prefix(expr, index_info) {
+        return Ok(Some(compound_expr));
+    }
+
     // Many scalar indices can efficiently handle a BETWEEN query as a single search and this
     // can be much more efficient than two separate range queries.  As an optimization we check
     // to see if this is a between query and, if so, we handle it as a single query
@@ -1582,6 +1668,8 @@ pub trait IndexInformationProvider {
 pub struct CompoundIndexInfo<'a> {
     /// Index name.
     pub index_name: &'a str,
+    /// Column names in index order.
+    pub columns: &'a [String],
     /// Column data types in index order.
     pub data_types: &'a [DataType],
     /// Query parser for the compound index.
@@ -2339,5 +2427,256 @@ mod tests {
             make_exact() | make_at_least(),
             NullableIndexExprResult::AtLeast(_)
         ));
+    }
+
+    // =========================================================================
+    // Compound Index Expression Tests
+    // =========================================================================
+
+    /// Mock for testing compound index expression parsing.
+    /// Supports both single-column indices (via get_index) and compound indices (via get_compound_index).
+    struct CompoundMockIndexInfoProvider {
+        indexed_columns: HashMap<String, ColInfo>,
+        compound_index: Option<CompoundIndexMock>,
+    }
+
+    struct CompoundIndexMock {
+        index_name: String,
+        columns: Vec<String>,
+        data_types: Vec<DataType>,
+        parser: Box<dyn ScalarQueryParser>,
+    }
+
+    impl CompoundMockIndexInfoProvider {
+        fn with_compound_index(
+            index_name: &str,
+            columns: Vec<&str>,
+            data_types: Vec<DataType>,
+        ) -> Self {
+            use crate::scalar::compound_btree::CompoundQueryParser;
+
+            let columns: Vec<String> = columns.into_iter().map(|s| s.to_string()).collect();
+            let parser = Box::new(CompoundQueryParser::new(
+                index_name.to_string(),
+                columns.clone(),
+                data_types.clone(),
+            ));
+
+            Self {
+                indexed_columns: HashMap::new(),
+                compound_index: Some(CompoundIndexMock {
+                    index_name: index_name.to_string(),
+                    columns,
+                    data_types,
+                    parser,
+                }),
+            }
+        }
+    }
+
+    impl IndexInformationProvider for CompoundMockIndexInfoProvider {
+        fn get_index(&self, col: &str) -> Option<(&DataType, &dyn ScalarQueryParser)> {
+            self.indexed_columns
+                .get(col)
+                .map(|col_info| (&col_info.data_type, col_info.parser.as_ref()))
+        }
+
+        fn get_compound_index(&self, cols: &[&str]) -> Option<CompoundIndexInfo<'_>> {
+            let compound = self.compound_index.as_ref()?;
+
+            // Check if cols form a prefix of the compound index columns
+            if cols.len() > compound.columns.len() {
+                return None;
+            }
+
+            // Check prefix match (order-independent: sort both and compare)
+            let mut query_cols: Vec<&str> = cols.to_vec();
+            query_cols.sort();
+
+            let prefix_cols: Vec<&str> = compound.columns[..cols.len()]
+                .iter()
+                .map(|s| s.as_str())
+                .collect();
+            let mut sorted_prefix: Vec<&str> = prefix_cols.clone();
+            sorted_prefix.sort();
+
+            if query_cols != sorted_prefix {
+                return None;
+            }
+
+            Some(CompoundIndexInfo {
+                index_name: &compound.index_name,
+                columns: &compound.columns,
+                data_types: &compound.data_types,
+                parser: compound.parser.as_ref(),
+            })
+        }
+    }
+
+    fn check_compound(
+        index_info: &dyn IndexInformationProvider,
+        expr: &str,
+        schema: &Schema,
+        expected_index_name: Option<&str>,
+    ) {
+        let df_schema: DFSchema = schema.clone().try_into().unwrap();
+
+        let ctx = get_session_context(&LanceExecutionOptions::default());
+        let state = ctx.state();
+        let expr = state.create_logical_expr(expr, &df_schema).unwrap();
+
+        let result = apply_scalar_indices(expr.clone(), index_info).unwrap();
+
+        match expected_index_name {
+            Some(expected_name) => {
+                assert!(
+                    result.scalar_query.is_some(),
+                    "Expected compound index '{}' to be used for '{}', but got no index query",
+                    expected_name,
+                    expr
+                );
+                // Verify the index name in the query
+                let query = result.scalar_query.unwrap();
+                match query {
+                    ScalarIndexExpr::Query(query_info) => {
+                        assert_eq!(
+                            query_info.index_name, expected_name,
+                            "Expected index '{}' but got '{}'",
+                            expected_name, query_info.index_name
+                        );
+                    }
+                    _ => panic!("Expected ScalarIndexExpr::Query, got {:?}", query),
+                }
+            }
+            None => {
+                // Should not use compound index - either no index or single-column index
+                if let Some(ref query) = result.scalar_query {
+                    match query {
+                        ScalarIndexExpr::Query(query_info) => {
+                            assert!(
+                                !query_info.index_name.contains("compound"),
+                                "Expected no compound index usage for '{}', but got index '{}'",
+                                expr,
+                                query_info.index_name
+                            );
+                        }
+                        _ => {} // AND/OR combinations are fine
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_compound_index_and_predicates() {
+        // Test compound index on (tenant_id, status)
+        // Note: Single-column equality predicates go through visit_comparison() which uses
+        // get_index(), not get_compound_index(). The compound index path is specifically
+        // for AND expressions with multiple equality predicates.
+        let index_info = CompoundMockIndexInfoProvider::with_compound_index(
+            "idx_compound",
+            vec!["tenant_id", "status"],
+            vec![DataType::Utf8, DataType::Utf8],
+        );
+
+        let schema = Schema::new(vec![
+            Field::new("tenant_id", DataType::Utf8, false),
+            Field::new("status", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, false),
+        ]);
+
+        // Full match: tenant_id = 'acme' AND status = 'active'
+        check_compound(
+            &index_info,
+            "tenant_id = 'acme' AND status = 'active'",
+            &schema,
+            Some("idx_compound"),
+        );
+
+        // Order independence: status = 'active' AND tenant_id = 'acme'
+        // The compound index should be used regardless of predicate order
+        check_compound(
+            &index_info,
+            "status = 'active' AND tenant_id = 'acme'",
+            &schema,
+            Some("idx_compound"),
+        );
+
+        // Single column predicates don't use compound index path (they use single-column index path)
+        // These should return None since our mock only has a compound index, not single-column indices
+        check_compound(&index_info, "tenant_id = 'acme'", &schema, None);
+        check_compound(&index_info, "status = 'active'", &schema, None);
+        check_compound(&index_info, "value = 100", &schema, None);
+    }
+
+    #[test]
+    fn test_compound_index_with_extra_predicates() {
+        // Test compound index with additional non-indexed predicates
+        let index_info = CompoundMockIndexInfoProvider::with_compound_index(
+            "idx_compound",
+            vec!["tenant_id", "status"],
+            vec![DataType::Utf8, DataType::Utf8],
+        );
+
+        let schema = Schema::new(vec![
+            Field::new("tenant_id", DataType::Utf8, false),
+            Field::new("status", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, false),
+        ]);
+
+        // Compound index columns + extra predicate
+        // Should use compound index and have value > 100 as refinement
+        check_compound(
+            &index_info,
+            "tenant_id = 'acme' AND status = 'active' AND value > 100",
+            &schema,
+            Some("idx_compound"),
+        );
+    }
+
+    #[test]
+    fn test_collect_equality_predicates() {
+        // Test the collect_equality_predicates helper function directly
+        use datafusion_common::ScalarValue;
+        use datafusion_expr::{col, lit};
+
+        // Single equality: a = 1
+        let expr = col("a").eq(lit(1i32));
+        let predicates = collect_equality_predicates(&expr);
+        assert_eq!(predicates.len(), 1);
+        assert_eq!(predicates[0].0, "a");
+        assert_eq!(predicates[0].1, ScalarValue::Int32(Some(1)));
+
+        // Two ANDed equalities: a = 1 AND b = 'foo'
+        let expr = col("a").eq(lit(1i32)).and(col("b").eq(lit("foo")));
+        let predicates = collect_equality_predicates(&expr);
+        assert_eq!(predicates.len(), 2);
+
+        // Nested AND: (a = 1 AND b = 2) AND c = 3
+        let expr = col("a")
+            .eq(lit(1i32))
+            .and(col("b").eq(lit(2i32)))
+            .and(col("c").eq(lit(3i32)));
+        let predicates = collect_equality_predicates(&expr);
+        assert_eq!(predicates.len(), 3);
+
+        // Mixed AND with non-equality: a = 1 AND b > 2
+        // Should only extract the equality
+        let expr = col("a").eq(lit(1i32)).and(col("b").gt(lit(2i32)));
+        let predicates = collect_equality_predicates(&expr);
+        assert_eq!(predicates.len(), 1);
+        assert_eq!(predicates[0].0, "a");
+
+        // OR expression: a = 1 OR b = 2
+        // Should return empty (OR is not an AND)
+        let expr = col("a").eq(lit(1i32)).or(col("b").eq(lit(2i32)));
+        let predicates = collect_equality_predicates(&expr);
+        assert_eq!(predicates.len(), 0);
+
+        // Column on right side: 1 = a
+        let expr = lit(1i32).eq(col("a"));
+        let predicates = collect_equality_predicates(&expr);
+        assert_eq!(predicates.len(), 1);
+        assert_eq!(predicates[0].0, "a");
     }
 }

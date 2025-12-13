@@ -208,9 +208,9 @@ impl ZoneMapIndex {
                     })?;
 
                 Ok(serde_json::json!({
-                    "fragment_id": zone.fragment_id,
-                    "zone_start": zone.zone_start,
-                    "zone_length": zone.zone_length,
+                    "fragment_id": zone.bound.fragment_id,
+                    "zone_start": zone.bound.start,
+                    "zone_length": zone.bound.length,
                     "min": min_value,
                     "max": max_value,
                     "null_count": zone.null_count,

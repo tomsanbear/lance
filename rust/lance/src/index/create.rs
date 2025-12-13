@@ -134,18 +134,11 @@ impl<'a> CreateIndexBuilder<'a> {
         let field = &fields[0];
 
         // If train is true but dataset is empty, automatically set train to false
-        let train = if self.train {
-            self.dataset.count_rows(None).await? > 0
-        } else {
-            false
-        };
+        let train = if self.train { self.dataset.count_rows(None).await? > 0 } else { false };
 
         // Load indices from the disk.
         let indices = self.dataset.load_indices().await?;
-        let fri = self
-            .dataset
-            .open_frag_reuse_index(&NoOpMetricsCollector)
-            .await?;
+        let fri = self.dataset.open_frag_reuse_index(&NoOpMetricsCollector).await?;
         // Generate index name: single column uses "column_idx", multiple use "col1_col2_idx"
         let index_name = self.name.take().unwrap_or_else(|| {
             if self.columns.len() == 1 {
@@ -224,159 +217,160 @@ impl<'a> CreateIndexBuilder<'a> {
         } else {
             // Single-column index path (existing logic)
             match (self.index_type, self.params.index_name()) {
-            (
-                IndexType::Bitmap
-                | IndexType::BTree
-                | IndexType::Inverted
-                | IndexType::NGram
-                | IndexType::ZoneMap
-                | IndexType::BloomFilter
-                | IndexType::LabelList,
-                LANCE_SCALAR_INDEX,
-            ) => {
-                assert!(
-                    self.preprocessed_data.is_none() || self.index_type.eq(&IndexType::BTree),
-                    "Preprocessed data stream can only be provided for B-Tree index type at the moment."
-                );
-                let base_params = ScalarIndexParams::for_builtin(self.index_type.try_into()?);
+                (
+                    IndexType::Bitmap
+                    | IndexType::BTree
+                    | IndexType::Inverted
+                    | IndexType::NGram
+                    | IndexType::ZoneMap
+                    | IndexType::BloomFilter
+                    | IndexType::LabelList,
+                    LANCE_SCALAR_INDEX,
+                ) => {
+                    assert!(
+                        self.preprocessed_data.is_none() || self.index_type.eq(&IndexType::BTree),
+                        "Preprocessed data stream can only be provided for B-Tree index type at the moment."
+                    );
+                    let base_params = ScalarIndexParams::for_builtin(self.index_type.try_into()?);
 
-                // If custom params were provided, extract the params JSON and apply it
-                let params = if let Some(provided_params) =
-                    self.params.as_any().downcast_ref::<ScalarIndexParams>()
-                {
-                    if let Some(params_json) = &provided_params.params {
-                        // Parse and apply the custom parameters
-                        if let Ok(json_value) =
-                            serde_json::from_str::<serde_json::Value>(params_json)
-                        {
-                            base_params.with_params(&json_value)
+                    // If custom params were provided, extract the params JSON and apply it
+                    let params = if let Some(provided_params) =
+                        self.params.as_any().downcast_ref::<ScalarIndexParams>()
+                    {
+                        if let Some(params_json) = &provided_params.params {
+                            // Parse and apply the custom parameters
+                            if let Ok(json_value) =
+                                serde_json::from_str::<serde_json::Value>(params_json)
+                            {
+                                base_params.with_params(&json_value)
+                            } else {
+                                base_params
+                            }
                         } else {
                             base_params
                         }
                     } else {
                         base_params
-                    }
-                } else {
-                    base_params
-                };
+                    };
 
-                let preprocesssed_data = self
-                    .preprocessed_data
-                    .take()
-                    .map(|reader| lance_datafusion::utils::reader_to_stream(Box::new(reader)));
-                build_scalar_index(
-                    self.dataset,
-                    column,
-                    &index_id.to_string(),
-                    &params,
-                    train,
-                    self.fragments.clone(),
-                    preprocesssed_data,
-                )
-                .await?
-            }
-            (IndexType::Scalar, LANCE_SCALAR_INDEX) => {
-                // Guess the index type
-                let params = self
-                    .params
-                    .as_any()
-                    .downcast_ref::<ScalarIndexParams>()
-                    .ok_or_else(|| Error::Index {
-                        message: "Scalar index type must take a ScalarIndexParams".to_string(),
-                        location: location!(),
-                    })?;
-                build_scalar_index(
-                    self.dataset,
-                    column,
-                    &index_id.to_string(),
-                    params,
-                    train,
-                    self.fragments.clone(),
-                    None,
-                )
-                .await?
-            }
-            (IndexType::Inverted, _) => {
-                // Inverted index params.
-                let inverted_params = self
-                    .params
-                    .as_any()
-                    .downcast_ref::<InvertedIndexParams>()
-                    .ok_or_else(|| Error::Index {
-                        message: "Inverted index type must take a InvertedIndexParams".to_string(),
-                        location: location!(),
-                    })?;
-
-                let params =
-                    ScalarIndexParams::new("inverted".to_string()).with_params(inverted_params);
-                build_scalar_index(
-                    self.dataset,
-                    column,
-                    &index_id.to_string(),
-                    &params,
-                    train,
-                    self.fragments.clone(),
-                    None,
-                )
-                .await?
-            }
-            (
-                IndexType::Vector
-                | IndexType::IvfPq
-                | IndexType::IvfSq
-                | IndexType::IvfFlat
-                | IndexType::IvfHnswFlat
-                | IndexType::IvfHnswPq
-                | IndexType::IvfHnswSq,
-                LANCE_VECTOR_INDEX,
-            ) => {
-                // Vector index params.
-                let vec_params = self
-                    .params
-                    .as_any()
-                    .downcast_ref::<VectorIndexParams>()
-                    .ok_or_else(|| Error::Index {
-                        message: "Vector index type must take a VectorIndexParams".to_string(),
-                        location: location!(),
-                    })?;
-
-                if train {
-                    // this is a large future so move it to heap
-                    Box::pin(build_vector_index(
+                    let preprocesssed_data = self
+                        .preprocessed_data
+                        .take()
+                        .map(|reader| lance_datafusion::utils::reader_to_stream(Box::new(reader)));
+                    build_scalar_index(
                         self.dataset,
                         column,
-                        &index_name,
                         &index_id.to_string(),
-                        vec_params,
-                        fri,
-                    ))
-                    .await?;
-                } else {
-                    // Create empty vector index
-                    build_empty_vector_index(
-                        self.dataset,
-                        column,
-                        &index_name,
-                        &index_id.to_string(),
-                        vec_params,
+                        &params,
+                        train,
+                        self.fragments.clone(),
+                        preprocesssed_data,
                     )
-                    .await?;
+                    .await?
                 }
-                CreatedIndex {
-                    index_details: vector_index_details(),
-                    index_version: VECTOR_INDEX_VERSION,
+                (IndexType::Scalar, LANCE_SCALAR_INDEX) => {
+                    // Guess the index type
+                    let params = self
+                        .params
+                        .as_any()
+                        .downcast_ref::<ScalarIndexParams>()
+                        .ok_or_else(|| Error::Index {
+                            message: "Scalar index type must take a ScalarIndexParams".to_string(),
+                            location: location!(),
+                        })?;
+                    build_scalar_index(
+                        self.dataset,
+                        column,
+                        &index_id.to_string(),
+                        params,
+                        train,
+                        self.fragments.clone(),
+                        None,
+                    )
+                    .await?
                 }
-            }
-            // Can't use if let Some(...) here because it's not stable yet.
-            // TODO: fix after https://github.com/rust-lang/rust/issues/51114
-            (IndexType::Vector, name)
-                if self
-                    .dataset
-                    .session
-                    .index_extensions
-                    .contains_key(&(IndexType::Vector, name.to_string())) =>
-            {
-                let ext = self
+                (IndexType::Inverted, _) => {
+                    // Inverted index params.
+                    let inverted_params = self
+                        .params
+                        .as_any()
+                        .downcast_ref::<InvertedIndexParams>()
+                        .ok_or_else(|| Error::Index {
+                            message: "Inverted index type must take a InvertedIndexParams"
+                                .to_string(),
+                            location: location!(),
+                        })?;
+
+                    let params =
+                        ScalarIndexParams::new("inverted".to_string()).with_params(inverted_params);
+                    build_scalar_index(
+                        self.dataset,
+                        column,
+                        &index_id.to_string(),
+                        &params,
+                        train,
+                        self.fragments.clone(),
+                        None,
+                    )
+                    .await?
+                }
+                (
+                    IndexType::Vector
+                    | IndexType::IvfPq
+                    | IndexType::IvfSq
+                    | IndexType::IvfFlat
+                    | IndexType::IvfHnswFlat
+                    | IndexType::IvfHnswPq
+                    | IndexType::IvfHnswSq,
+                    LANCE_VECTOR_INDEX,
+                ) => {
+                    // Vector index params.
+                    let vec_params = self
+                        .params
+                        .as_any()
+                        .downcast_ref::<VectorIndexParams>()
+                        .ok_or_else(|| Error::Index {
+                            message: "Vector index type must take a VectorIndexParams".to_string(),
+                            location: location!(),
+                        })?;
+
+                    if train {
+                        // this is a large future so move it to heap
+                        Box::pin(build_vector_index(
+                            self.dataset,
+                            column,
+                            &index_name,
+                            &index_id.to_string(),
+                            vec_params,
+                            fri,
+                        ))
+                        .await?;
+                    } else {
+                        // Create empty vector index
+                        build_empty_vector_index(
+                            self.dataset,
+                            column,
+                            &index_name,
+                            &index_id.to_string(),
+                            vec_params,
+                        )
+                        .await?;
+                    }
+                    CreatedIndex {
+                        index_details: vector_index_details(),
+                        index_version: VECTOR_INDEX_VERSION,
+                    }
+                }
+                // Can't use if let Some(...) here because it's not stable yet.
+                // TODO: fix after https://github.com/rust-lang/rust/issues/51114
+                (IndexType::Vector, name)
+                    if self
+                        .dataset
+                        .session
+                        .index_extensions
+                        .contains_key(&(IndexType::Vector, name.to_string())) =>
+                {
+                    let ext = self
                     .dataset
                     .session
                     .index_extensions
@@ -391,33 +385,33 @@ impl<'a> CreateIndexBuilder<'a> {
                         location: location!(),
                     })?;
 
-                if train {
-                    ext.create_index(self.dataset, column, &index_id.to_string(), self.params)
-                        .await?;
-                } else {
-                    todo!("create empty vector index when train=false");
+                    if train {
+                        ext.create_index(self.dataset, column, &index_id.to_string(), self.params)
+                            .await?;
+                    } else {
+                        todo!("create empty vector index when train=false");
+                    }
+                    CreatedIndex {
+                        index_details: vector_index_details(),
+                        index_version: VECTOR_INDEX_VERSION,
+                    }
                 }
-                CreatedIndex {
-                    index_details: vector_index_details(),
-                    index_version: VECTOR_INDEX_VERSION,
+                (IndexType::FragmentReuse, _) => {
+                    return Err(Error::Index {
+                        message: "Fragment reuse index can only be created through compaction"
+                            .to_string(),
+                        location: location!(),
+                    })
+                }
+                (index_type, index_name) => {
+                    return Err(Error::Index {
+                        message: format!(
+                            "Index type {index_type} with name {index_name} is not supported"
+                        ),
+                        location: location!(),
+                    });
                 }
             }
-            (IndexType::FragmentReuse, _) => {
-                return Err(Error::Index {
-                    message: "Fragment reuse index can only be created through compaction"
-                        .to_string(),
-                    location: location!(),
-                })
-            }
-            (index_type, index_name) => {
-                return Err(Error::Index {
-                    message: format!(
-                        "Index type {index_type} with name {index_name} is not supported"
-                    ),
-                    location: location!(),
-                });
-            }
-        }
         }; // Close the if-else for multi-column check
 
         Ok(IndexMetadata {
@@ -428,13 +422,9 @@ impl<'a> CreateIndexBuilder<'a> {
             fragment_bitmap: if train {
                 match &self.fragments {
                     Some(fragment_ids) => Some(fragment_ids.iter().collect()),
-                    None => Some(
-                        self.dataset
-                            .get_fragments()
-                            .iter()
-                            .map(|f| f.id() as u32)
-                            .collect(),
-                    ),
+                    None => {
+                        Some(self.dataset.get_fragments().iter().map(|f| f.id() as u32).collect())
+                    }
                 }
             } else {
                 // Empty bitmap for untrained indices
@@ -452,16 +442,11 @@ impl<'a> CreateIndexBuilder<'a> {
         let new_idx = self.execute_uncommitted().await?;
         let transaction = Transaction::new(
             new_idx.dataset_version,
-            Operation::CreateIndex {
-                new_indices: vec![new_idx],
-                removed_indices: vec![],
-            },
+            Operation::CreateIndex { new_indices: vec![new_idx], removed_indices: vec![] },
             None,
         );
 
-        self.dataset
-            .apply_commit(transaction, &Default::default(), &Default::default())
-            .await?;
+        self.dataset.apply_commit(transaction, &Default::default(), &Default::default()).await?;
 
         Ok(())
     }
@@ -544,27 +529,18 @@ mod tests {
             vec![Ok(batch1), Ok(batch2), Ok(batch3)],
             create_text_batch(0, 1).schema(),
         );
-        let mut dataset = Dataset::write(batches, &dataset_uri, Some(write_params))
-            .await
-            .unwrap();
+        let mut dataset = Dataset::write(batches, &dataset_uri, Some(write_params)).await.unwrap();
 
         let params = InvertedIndexParams::default();
 
         // Get fragment IDs from the dataset
         let fragments = dataset.get_fragments();
         let fragment_ids: Vec<u32> = fragments.iter().map(|f| f.id() as u32).collect();
-        assert!(
-            fragment_ids.len() >= 2,
-            "Should have multiple fragments for testing"
-        );
+        assert!(fragment_ids.len() >= 2, "Should have multiple fragments for testing");
 
         // Test fragments() method with specific fragment IDs and ensure duplicate/out-of-order fragments are handled properly
-        let selected_fragments = vec![
-            fragment_ids[1],
-            fragment_ids[0],
-            fragment_ids[1],
-            fragment_ids[2],
-        ];
+        let selected_fragments =
+            vec![fragment_ids[1], fragment_ids[0], fragment_ids[1], fragment_ids[2]];
         let selected_fragments_expected = vec![fragment_ids[0], fragment_ids[1], fragment_ids[2]];
 
         let mut builder =
@@ -606,20 +582,15 @@ mod tests {
         let batch2 = create_text_batch(15, 30);
         let batch3 = create_text_batch(30, 45);
 
-        let write_params = WriteParams {
-            max_rows_per_file: 15,
-            max_rows_per_group: 5,
-            ..Default::default()
-        };
+        let write_params =
+            WriteParams { max_rows_per_file: 15, max_rows_per_group: 5, ..Default::default() };
 
         // Write dataset with multiple batches to create multiple fragments
         let batches = RecordBatchIterator::new(
             vec![Ok(batch1), Ok(batch2), Ok(batch3)],
             create_text_batch(0, 1).schema(),
         );
-        let mut dataset = Dataset::write(batches, &dataset_uri, Some(write_params))
-            .await
-            .unwrap();
+        let mut dataset = Dataset::write(batches, &dataset_uri, Some(write_params)).await.unwrap();
 
         let params = InvertedIndexParams::default();
         let fragments = dataset.get_fragments();
@@ -762,10 +733,7 @@ mod tests {
 
         let num_new_rows = 32;
         let new_reader = lance_datagen::gen_batch()
-            .col(
-                "id",
-                lance_datagen::array::step_custom::<Int32Type>(num_rows as i32, 1),
-            )
+            .col("id", lance_datagen::array::step_custom::<Int32Type>(num_rows as i32, 1))
             .col(
                 "vector",
                 lance_datagen::array::rand_vec::<Float32Type>(lance_datagen::Dimension::from(16)),
@@ -778,10 +746,7 @@ mod tests {
         dataset = Dataset::write(
             new_reader,
             &dataset_uri,
-            Some(WriteParams {
-                mode: WriteMode::Append,
-                ..Default::default()
-            }),
+            Some(WriteParams { mode: WriteMode::Append, ..Default::default() }),
         )
         .await
         .unwrap();
@@ -802,31 +767,18 @@ mod tests {
         // 2. one delta vector index with name "vector_idx", and the bitmap is [0]
         // 3. one delta vector index with name "vector_idx", and the bitmap is [1]
         assert_eq!(indices_after.len(), 3, "{:?}", indices_after);
-        let id_idx = indices_after
-            .iter()
-            .find(|idx| idx.name == "id_idx")
-            .unwrap();
-        let vector_indices = indices_after
-            .iter()
-            .filter(|idx| idx.name == "vector_idx")
-            .collect::<Vec<_>>();
+        let id_idx = indices_after.iter().find(|idx| idx.name == "id_idx").unwrap();
+        let vector_indices =
+            indices_after.iter().filter(|idx| idx.name == "vector_idx").collect::<Vec<_>>();
         assert!(
-            id_idx
-                .fragment_bitmap
-                .as_ref()
-                .unwrap()
-                .contains_range(0..2)
+            id_idx.fragment_bitmap.as_ref().unwrap().contains_range(0..2)
                 && id_idx.fragment_bitmap.as_ref().unwrap().len() == 2
         );
         assert_eq!(vector_indices.len(), 2);
-        assert!(vector_indices
-            .iter()
-            .any(|idx| idx.fragment_bitmap.as_ref().unwrap().contains(0)
-                && idx.fragment_bitmap.as_ref().unwrap().len() == 1));
-        assert!(vector_indices
-            .iter()
-            .any(|idx| idx.fragment_bitmap.as_ref().unwrap().contains(1)
-                && idx.fragment_bitmap.as_ref().unwrap().len() == 1));
+        assert!(vector_indices.iter().any(|idx| idx.fragment_bitmap.as_ref().unwrap().contains(0)
+            && idx.fragment_bitmap.as_ref().unwrap().len() == 1));
+        assert!(vector_indices.iter().any(|idx| idx.fragment_bitmap.as_ref().unwrap().contains(1)
+            && idx.fragment_bitmap.as_ref().unwrap().len() == 1));
     }
 
     #[tokio::test]
@@ -870,17 +822,12 @@ mod tests {
         )
         .unwrap();
 
-        let write_params = WriteParams {
-            max_rows_per_file: 50,
-            max_rows_per_group: 25,
-            ..Default::default()
-        };
+        let write_params =
+            WriteParams { max_rows_per_file: 50, max_rows_per_group: 25, ..Default::default() };
 
         // Write dataset
         let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
-        let mut dataset = Dataset::write(batches, &dataset_uri, Some(write_params))
-            .await
-            .unwrap();
+        let mut dataset = Dataset::write(batches, &dataset_uri, Some(write_params)).await.unwrap();
 
         // Create compound index on tenant_id and status
         let params = ScalarIndexParams::default();
@@ -901,11 +848,7 @@ mod tests {
 
         let compound_idx = &indices[0];
         assert_eq!(compound_idx.name, "compound_idx");
-        assert_eq!(
-            compound_idx.fields.len(),
-            2,
-            "Compound index should have 2 fields"
-        );
+        assert_eq!(compound_idx.fields.len(), 2, "Compound index should have 2 fields");
 
         // Verify we can load the index details
         let index_details = compound_idx.index_details.as_ref().expect("should have details");
@@ -942,15 +885,8 @@ mod tests {
 
         // Try to create compound index with vector type - should fail
         let params = VectorIndexParams::ivf_flat(8, MetricType::Cosine);
-        let result = dataset
-            .create_index(
-                &["col1", "col2"],
-                IndexType::Vector,
-                None,
-                &params,
-                false,
-            )
-            .await;
+        let result =
+            dataset.create_index(&["col1", "col2"], IndexType::Vector, None, &params, false).await;
 
         assert!(result.is_err(), "Vector index should not support multiple columns");
         let err = result.unwrap_err();
@@ -967,11 +903,11 @@ mod tests {
     /// bug is in Lance's compound index implementation or in catalyzed-lance's usage.
     #[tokio::test]
     async fn test_compound_index_search_cartesian_product() {
+        use datafusion::common::ScalarValue;
+        use lance_index::metrics::NoOpMetricsCollector;
         use lance_index::scalar::compound::CompoundSargableQuery;
         use lance_index::scalar::{ScalarIndex, ScalarIndexParams};
-        use lance_index::metrics::NoOpMetricsCollector;
         use lance_index::DatasetIndexExt;
-        use datafusion::common::ScalarValue;
 
         // Create temporary directory for dataset
         let tmpdir = TempStrDir::default();
@@ -995,9 +931,7 @@ mod tests {
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(vec![
-                    "acme", "acme", "acme", "beta", "beta", "gamma",
-                ])),
+                Arc::new(StringArray::from(vec!["acme", "acme", "acme", "beta", "beta", "gamma"])),
                 Arc::new(StringArray::from(vec![
                     "active", "active", "inactive", "active", "inactive", "active",
                 ])),
@@ -1027,11 +961,7 @@ mod tests {
         let indices = dataset.load_indices().await.unwrap();
         let compound_idx = &indices[0];
         let scalar_index = dataset
-            .open_scalar_index(
-                "tenant_id",
-                &compound_idx.uuid.to_string(),
-                &NoOpMetricsCollector,
-            )
+            .open_scalar_index("tenant_id", &compound_idx.uuid.to_string(), &NoOpMetricsCollector)
             .await
             .unwrap();
 
@@ -1045,12 +975,11 @@ mod tests {
             prefix: vec![ScalarValue::Utf8(Some("acme".to_string()))],
             range: None,
         };
-        let result_prefix = scalar_index
-            .search(&query_prefix_only, &NoOpMetricsCollector)
-            .await
-            .unwrap();
+        let result_prefix =
+            scalar_index.search(&query_prefix_only, &NoOpMetricsCollector).await.unwrap();
         let row_ids_prefix: Vec<u64> = result_prefix
             .row_addrs()
+            .true_rows()
             .row_addrs()
             .map(|iter| iter.map(u64::from).collect())
             .unwrap_or_default();
@@ -1067,16 +996,12 @@ mod tests {
         let result1 = scalar_index.search(&query1, &NoOpMetricsCollector).await.unwrap();
         let row_ids1: Vec<u64> = result1
             .row_addrs()
+            .true_rows()
             .row_addrs()
             .map(|iter| iter.map(u64::from).collect())
             .unwrap_or_default();
         println!("Query (acme, active): {:?}", row_ids1);
-        assert_eq!(
-            row_ids1.len(),
-            2,
-            "(acme, active) should return 2 rows, got {:?}",
-            row_ids1
-        );
+        assert_eq!(row_ids1.len(), 2, "(acme, active) should return 2 rows, got {:?}", row_ids1);
 
         // Let's see what row 2 (acme, inactive, 300) looks like in the dataset
         let row2_projection = crate::dataset::ProjectionRequest::from_columns(
@@ -1084,7 +1009,8 @@ mod tests {
             dataset.schema(),
         );
         let row2_data = dataset.take_rows(&[2], row2_projection).await.unwrap();
-        println!("Row 2 data: tenant_id={:?}, status={:?}, value={:?}",
+        println!(
+            "Row 2 data: tenant_id={:?}, status={:?}, value={:?}",
             row2_data.column_by_name("tenant_id").unwrap(),
             row2_data.column_by_name("status").unwrap(),
             row2_data.column_by_name("value").unwrap(),
@@ -1101,16 +1027,12 @@ mod tests {
         let result2 = scalar_index.search(&query2, &NoOpMetricsCollector).await.unwrap();
         let row_ids2: Vec<u64> = result2
             .row_addrs()
+            .true_rows()
             .row_addrs()
             .map(|iter| iter.map(u64::from).collect())
             .unwrap_or_default();
         println!("Query (acme, inactive): {:?}", row_ids2);
-        assert_eq!(
-            row_ids2.len(),
-            1,
-            "(acme, inactive) should return 1 row, got {:?}",
-            row_ids2
-        );
+        assert_eq!(row_ids2.len(), 1, "(acme, inactive) should return 1 row, got {:?}", row_ids2);
 
         // Test 3: (beta, active) - should return 1 row
         let query3 = CompoundSargableQuery::PrefixLookup {
@@ -1123,15 +1045,11 @@ mod tests {
         let result3 = scalar_index.search(&query3, &NoOpMetricsCollector).await.unwrap();
         let row_ids3: Vec<u64> = result3
             .row_addrs()
+            .true_rows()
             .row_addrs()
             .map(|iter| iter.map(u64::from).collect())
             .unwrap_or_default();
-        assert_eq!(
-            row_ids3.len(),
-            1,
-            "(beta, active) should return 1 row, got {:?}",
-            row_ids3
-        );
+        assert_eq!(row_ids3.len(), 1, "(beta, active) should return 1 row, got {:?}", row_ids3);
 
         // Test 4: (beta, inactive) - should return 1 row
         let query4 = CompoundSargableQuery::PrefixLookup {
@@ -1144,15 +1062,11 @@ mod tests {
         let result4 = scalar_index.search(&query4, &NoOpMetricsCollector).await.unwrap();
         let row_ids4: Vec<u64> = result4
             .row_addrs()
+            .true_rows()
             .row_addrs()
             .map(|iter| iter.map(u64::from).collect())
             .unwrap_or_default();
-        assert_eq!(
-            row_ids4.len(),
-            1,
-            "(beta, inactive) should return 1 row, got {:?}",
-            row_ids4
-        );
+        assert_eq!(row_ids4.len(), 1, "(beta, inactive) should return 1 row, got {:?}", row_ids4);
 
         // Verify total: 2 + 1 + 1 + 1 = 5 unique rows
         let mut all_row_ids: Vec<u64> = vec![];
@@ -1162,12 +1076,7 @@ mod tests {
         all_row_ids.extend(&row_ids4);
         all_row_ids.sort();
         all_row_ids.dedup();
-        assert_eq!(
-            all_row_ids.len(),
-            5,
-            "Total unique rows should be 5, got {:?}",
-            all_row_ids
-        );
+        assert_eq!(all_row_ids.len(), 5, "Total unique rows should be 5, got {:?}", all_row_ids);
 
         // Fetch the actual rows to verify values
         let projection = crate::dataset::ProjectionRequest::from_columns(
@@ -1178,12 +1087,8 @@ mod tests {
         assert_eq!(fetched.num_rows(), 5);
 
         // Verify the values are correct (100, 200, 300, 400, 500)
-        let value_col = fetched
-            .column_by_name("value")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
+        let value_col =
+            fetched.column_by_name("value").unwrap().as_any().downcast_ref::<Int32Array>().unwrap();
         let mut values: Vec<i32> = (0..value_col.len()).map(|i| value_col.value(i)).collect();
         values.sort();
         assert_eq!(
@@ -1191,6 +1096,394 @@ mod tests {
             vec![100, 200, 300, 400, 500],
             "Values should be [100, 200, 300, 400, 500], got {:?}",
             values
+        );
+    }
+
+    /// Test compound index with compaction using fragment reuse path.
+    ///
+    /// This test verifies that compound indices work correctly with the fragment
+    /// reuse index during compaction when defer_index_remap is enabled.
+    #[tokio::test]
+    async fn test_compound_index_with_compaction_and_fragment_reuse() {
+        use crate::dataset::optimize::{compact_files, CompactionOptions};
+        use datafusion::common::ScalarValue;
+        use lance_index::metrics::NoOpMetricsCollector;
+        use lance_index::scalar::compound::CompoundSargableQuery;
+        use lance_index::scalar::{ScalarIndex, ScalarIndexParams};
+        use lance_index::DatasetIndexExt;
+
+        // Create dataset with multiple fragments
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("tenant_id", DataType::Utf8, false),
+            ArrowField::new("status", DataType::Utf8, false),
+            ArrowField::new("value", DataType::Int32, false),
+        ]));
+
+        // Write first fragment
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["acme", "acme", "beta"])),
+                Arc::new(StringArray::from(vec!["active", "inactive", "active"])),
+                Arc::new(Int32Array::from(vec![100, 200, 300])),
+            ],
+        )
+        .unwrap();
+
+        let write_params = WriteParams { max_rows_per_file: 3, ..Default::default() };
+        let batches = RecordBatchIterator::new(vec![Ok(batch1)], schema.clone());
+        let mut dataset =
+            Dataset::write(batches, &dataset_uri, Some(write_params.clone())).await.unwrap();
+
+        // Write second fragment (append to existing dataset)
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["beta", "gamma", "gamma"])),
+                Arc::new(StringArray::from(vec!["inactive", "active", "inactive"])),
+                Arc::new(Int32Array::from(vec![400, 500, 600])),
+            ],
+        )
+        .unwrap();
+
+        let batches = RecordBatchIterator::new(vec![Ok(batch2)], schema.clone());
+        dataset = Dataset::write(
+            batches,
+            &dataset_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                max_rows_per_file: 3,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Verify we have 2 fragments
+        assert_eq!(dataset.fragments().len(), 2, "Should have 2 fragments");
+
+        // Create compound index on tenant_id and status
+        let params = ScalarIndexParams::default();
+        dataset
+            .create_index(
+                &["tenant_id", "status"],
+                IndexType::BTree,
+                Some("idx_compound".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Verify index was created
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1, "Should have 1 index");
+        let compound_idx = &indices[0];
+        assert_eq!(compound_idx.fields.len(), 2, "Should index 2 fields");
+
+        // Test query before compaction
+        let scalar_index = dataset
+            .open_scalar_index("tenant_id", &compound_idx.uuid.to_string(), &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        let query_before = CompoundSargableQuery::PrefixLookup {
+            prefix: vec![
+                ScalarValue::Utf8(Some("beta".to_string())),
+                ScalarValue::Utf8(Some("active".to_string())),
+            ],
+            range: None,
+        };
+        let result_before =
+            scalar_index.search(&query_before, &NoOpMetricsCollector).await.unwrap();
+        let row_ids_before: Vec<u64> = result_before
+            .row_addrs()
+            .true_rows()
+            .row_addrs()
+            .map(|iter| iter.map(u64::from).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            row_ids_before.len(),
+            1,
+            "Should find 1 row for (beta, active) before compaction"
+        );
+
+        // Compact with defer_index_remap enabled (uses fragment reuse path)
+        let compaction_options =
+            CompactionOptions { defer_index_remap: true, ..Default::default() };
+        compact_files(&mut dataset, compaction_options, None).await.unwrap();
+
+        // Reload dataset after compaction
+        dataset = Dataset::open(&dataset_uri).await.unwrap();
+
+        // Verify we now have 1 fragment after compaction
+        assert_eq!(dataset.fragments().len(), 1, "Should have 1 fragment after compaction");
+
+        // Verify index still exists
+        let indices_after = dataset.load_indices().await.unwrap();
+        // Should have the compound index plus the fragment reuse index
+        assert!(
+            indices_after.len() >= 1,
+            "Should have at least the compound index after compaction"
+        );
+
+        // Test query after compaction - should still work via fragment reuse
+        let compound_idx_after = indices_after
+            .iter()
+            .find(|idx| idx.name == "idx_compound")
+            .expect("Compound index should still exist");
+
+        let scalar_index_after = dataset
+            .open_scalar_index(
+                "tenant_id",
+                &compound_idx_after.uuid.to_string(),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+
+        let query_after = CompoundSargableQuery::PrefixLookup {
+            prefix: vec![
+                ScalarValue::Utf8(Some("beta".to_string())),
+                ScalarValue::Utf8(Some("active".to_string())),
+            ],
+            range: None,
+        };
+        let result_after =
+            scalar_index_after.search(&query_after, &NoOpMetricsCollector).await.unwrap();
+        let row_ids_after: Vec<u64> = result_after
+            .row_addrs()
+            .true_rows()
+            .row_addrs()
+            .map(|iter| iter.map(u64::from).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            row_ids_after.len(),
+            1,
+            "Should still find 1 row for (beta, active) after compaction via fragment reuse"
+        );
+
+        // Verify we can fetch the actual data
+        let projection = crate::dataset::ProjectionRequest::from_columns(
+            ["tenant_id", "status", "value"],
+            dataset.schema(),
+        );
+        let fetched = dataset.take_rows(&row_ids_after, projection).await.unwrap();
+        assert_eq!(fetched.num_rows(), 1, "Should fetch 1 row");
+
+        let tenant_col = fetched
+            .column_by_name("tenant_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(tenant_col.value(0), "beta");
+
+        let status_col = fetched
+            .column_by_name("status")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(status_col.value(0), "active");
+    }
+
+    /// Test compound index with mixed indexed and unindexed fragments.
+    ///
+    /// This test verifies that queries work correctly when some fragments
+    /// are indexed and others are not (partial index coverage).
+    #[tokio::test]
+    async fn test_compound_index_mixed_fragment_coverage() {
+        use lance_index::scalar::ScalarIndexParams;
+        use lance_index::DatasetIndexExt;
+
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("tenant_id", DataType::Utf8, false),
+            ArrowField::new("status", DataType::Utf8, false),
+            ArrowField::new("value", DataType::Int32, false),
+        ]));
+
+        // Write first fragment
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["acme", "acme", "beta"])),
+                Arc::new(StringArray::from(vec!["active", "inactive", "active"])),
+                Arc::new(Int32Array::from(vec![100, 200, 300])),
+            ],
+        )
+        .unwrap();
+
+        let write_params = WriteParams { max_rows_per_file: 3, ..Default::default() };
+        let batches = RecordBatchIterator::new(vec![Ok(batch1)], schema.clone());
+        let mut dataset =
+            Dataset::write(batches, &dataset_uri, Some(write_params.clone())).await.unwrap();
+
+        // Create compound index on first fragment only
+        let params = ScalarIndexParams::default();
+        dataset
+            .create_index(
+                &["tenant_id", "status"],
+                IndexType::BTree,
+                Some("idx_compound".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        // Verify index covers fragment 0
+        let indices = dataset.load_indices().await.unwrap();
+        let compound_idx = &indices[0];
+        let frag_bitmap = compound_idx.fragment_bitmap.as_ref().unwrap();
+        assert!(frag_bitmap.contains(0), "Index should cover fragment 0");
+        assert_eq!(frag_bitmap.len(), 1, "Index should only cover 1 fragment");
+
+        // Write second fragment (not indexed) - append to existing dataset
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["beta", "gamma", "gamma"])),
+                Arc::new(StringArray::from(vec!["inactive", "active", "inactive"])),
+                Arc::new(Int32Array::from(vec![400, 500, 600])),
+            ],
+        )
+        .unwrap();
+
+        let batches = RecordBatchIterator::new(vec![Ok(batch2)], schema.clone());
+        dataset = Dataset::write(
+            batches,
+            &dataset_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                max_rows_per_file: 3,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Reload to get updated fragment list
+        dataset = Dataset::open(&dataset_uri).await.unwrap();
+        assert_eq!(dataset.fragments().len(), 2, "Should have 2 fragments");
+
+        // Verify index still only covers fragment 0
+        let indices_after = dataset.load_indices().await.unwrap();
+        let compound_idx_after = &indices_after[0];
+        let frag_bitmap_after = compound_idx_after.fragment_bitmap.as_ref().unwrap();
+        assert_eq!(frag_bitmap_after.len(), 1, "Index should still only cover 1 fragment");
+
+        // Query for data that exists in both fragments
+        // ("beta", "active") is in fragment 0 (indexed)
+        // ("beta", "inactive") is in fragment 1 (not indexed)
+        let result = dataset
+            .scan()
+            .filter("tenant_id = 'beta' AND status = 'active'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert_eq!(result.num_rows(), 1, "Should find 1 row for (beta, active)");
+        let value_col =
+            result.column_by_name("value").unwrap().as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(value_col.value(0), 300, "Should find value 300 from fragment 0");
+
+        // Query for data only in unindexed fragment
+        let result2 = dataset
+            .scan()
+            .filter("tenant_id = 'gamma' AND status = 'active'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result2.num_rows(),
+            1,
+            "Should find 1 row for (gamma, active) in unindexed fragment"
+        );
+        let value_col2 =
+            result2.column_by_name("value").unwrap().as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(value_col2.value(0), 500, "Should find value 500 from unindexed fragment 1");
+
+        // Query for data spanning both fragments
+        let result3 =
+            dataset.scan().filter("tenant_id = 'beta'").unwrap().try_into_batch().await.unwrap();
+
+        assert_eq!(
+            result3.num_rows(),
+            2,
+            "Should find 2 rows for tenant 'beta' across both fragments"
+        );
+        let value_col3 =
+            result3.column_by_name("value").unwrap().as_any().downcast_ref::<Int32Array>().unwrap();
+        let mut values: Vec<i32> = (0..value_col3.len()).map(|i| value_col3.value(i)).collect();
+        values.sort();
+        assert_eq!(values, vec![300, 400], "Should find values 300 (indexed) and 400 (unindexed)");
+
+        // Test order independence: status first, then tenant_id
+        // Should return same results as tenant_id first
+        let result_reversed = dataset
+            .scan()
+            .filter("status = 'active' AND tenant_id = 'beta'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result_reversed.num_rows(),
+            1,
+            "Reversed predicate order should find 1 row for (beta, active)"
+        );
+        let value_col_reversed = result_reversed
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(
+            value_col_reversed.value(0),
+            300,
+            "Reversed predicate order should find same value 300"
+        );
+
+        // Verify the query plan shows index usage for the indexed fragment
+        let plan = dataset
+            .scan()
+            .filter("tenant_id = 'acme' AND status = 'active'")
+            .unwrap()
+            .explain_plan(false)
+            .await
+            .unwrap();
+
+        // The plan should mention the index
+        assert!(
+            plan.contains("idx_compound") || plan.contains("ScalarIndexScan"),
+            "Query plan should indicate index usage for indexed fragment, got: {}",
+            plan
+        );
+
+        // Also verify reversed order uses index
+        let plan_reversed = dataset
+            .scan()
+            .filter("status = 'active' AND tenant_id = 'acme'")
+            .unwrap()
+            .explain_plan(false)
+            .await
+            .unwrap();
+
+        assert!(
+            plan_reversed.contains("idx_compound") || plan_reversed.contains("ScalarIndexScan"),
+            "Reversed predicate order should also use index, got: {}",
+            plan_reversed
         );
     }
 }
