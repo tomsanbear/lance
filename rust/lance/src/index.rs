@@ -1155,11 +1155,11 @@ impl DatasetIndexExt for Dataset {
         column: &str,
         index_name: &str,
     ) -> Result<Option<Arc<dyn Index>>> {
-        use lance_index::{metrics::NoOpMetricsCollector, ScalarIndexCriteria};
+        use lance_index::{metrics::NoOpMetricsCollector, IndexCriteria};
 
         // Find index metadata by name
         let idx_metadata =
-            self.load_scalar_index(ScalarIndexCriteria::default().with_name(index_name)).await?;
+            self.load_scalar_index(IndexCriteria::default().with_name(index_name)).await?;
 
         match idx_metadata {
             Some(metadata) => {

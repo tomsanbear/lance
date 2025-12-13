@@ -634,7 +634,7 @@ impl Index for ZoneMapIndex {
         // proper roundtrip serialization without loss of type information
         let min_proto: Option<protobuf::ScalarValue> = global_min
             .as_ref()
-            .map(|v| protobuf::ScalarValue::try_from(v))
+            .map(protobuf::ScalarValue::try_from)
             .transpose()
             .map_err(|e| Error::Index {
                 message: format!("Failed to convert min value to protobuf: {}", e),
@@ -643,7 +643,7 @@ impl Index for ZoneMapIndex {
 
         let max_proto: Option<protobuf::ScalarValue> = global_max
             .as_ref()
-            .map(|v| protobuf::ScalarValue::try_from(v))
+            .map(protobuf::ScalarValue::try_from)
             .transpose()
             .map_err(|e| Error::Index {
                 message: format!("Failed to convert max value to protobuf: {}", e),

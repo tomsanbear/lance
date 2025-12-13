@@ -20,10 +20,25 @@
 //! 2. Per-column min/max/null_count statistics (enables skip-scan, non-prefix pruning)
 //! 3. Uses Arrow Row Format for compound key comparison
 //! 4. Separate file names to avoid confusion
+//!
+//! # Key Types
+//!
+//! - [`CompoundBTreeIndex`]: Main index struct implementing [`ScalarIndex`](super::ScalarIndex)
+//! - [`CompoundFlatIndexMetadata`]: Training metadata for flat page storage
+//! - [`train_compound_btree_index`]: Main training entry point
+//!
+//! # See Also
+//!
+//! - [`compound`](super::compound): Core types ([`CompoundKey`](super::compound::CompoundKey),
+//!   [`CompoundIndexSchema`](super::compound::CompoundIndexSchema),
+//!   [`CompoundSargableQuery`](super::compound::CompoundSargableQuery))
+//! - [`btree`](super::btree): Single-column BTree index (architectural reference)
 
-use std::collections::HashMap;
-use std::fmt::Debug;
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    sync::Arc,
+};
 
 use arrow_array::{
     cast::AsArray, new_empty_array, types::UInt64Type, Array, ArrayRef, RecordBatch, UInt32Array,
@@ -38,7 +53,9 @@ use deepsize::DeepSizeOf;
 use futures::TryStreamExt;
 use lance_core::{Error, Result, ROW_ID};
 use lance_datafusion::chunker::chunk_concat_stream;
+use log::debug;
 use snafu::location;
+use tracing::instrument;
 
 use super::compound::{CompoundIndexSchema, COMPOUND_SORT_OPTIONS};
 use super::{IndexStore, IndexWriter, ScalarIndex};
@@ -163,18 +180,27 @@ impl CompoundFlatIndexMetadata {
     /// * `column_names` - Names of the value columns in index order
     /// * `data_types` - Data types for each value column
     ///
+    /// # Errors
+    ///
+    /// Returns an error if the number of column names does not match the number of data types.
+    ///
     /// # Schema
     ///
     /// The resulting schema will be:
     /// ```text
     /// [column_names[0]: data_types[0], ..., column_names[N-1]: data_types[N-1], _rowid: UInt64]
     /// ```
-    pub fn new(column_names: Vec<String>, data_types: Vec<DataType>) -> Self {
-        assert_eq!(
-            column_names.len(),
-            data_types.len(),
-            "Column names and data types must have the same length"
-        );
+    pub fn new(column_names: Vec<String>, data_types: Vec<DataType>) -> Result<Self> {
+        if column_names.len() != data_types.len() {
+            return Err(Error::Index {
+                message: format!(
+                    "Column names count ({}) does not match data types count ({})",
+                    column_names.len(),
+                    data_types.len()
+                ),
+                location: location!(),
+            });
+        }
 
         let mut fields: Vec<Field> = column_names
             .iter()
@@ -183,11 +209,11 @@ impl CompoundFlatIndexMetadata {
             .collect();
         fields.push(Field::new(COMPOUND_IDS_COLUMN, DataType::UInt64, false));
 
-        Self {
+        Ok(Self {
             schema: Arc::new(Schema::new(fields)),
             num_columns: column_names.len(),
             column_names,
-        }
+        })
     }
 
     /// Get the number of value columns.
@@ -961,21 +987,36 @@ fn compound_stats_as_batch(
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```no_run
+/// # use lance_index::scalar::compound::CompoundIndexSchema;
+/// # use lance_index::scalar::compound_btree::{train_compound_btree_index, CompoundFlatIndexMetadata};
+/// # use arrow_schema::DataType;
+/// # async fn example(
+/// #     sorted_data_stream: datafusion::physical_plan::SendableRecordBatchStream,
+/// #     index_store: &dyn lance_index::scalar::IndexStore,
+/// # ) -> lance_core::Result<()> {
 /// let schema = CompoundIndexSchema::new(
 ///     vec!["tenant_id".to_string(), "timestamp".to_string()],
 ///     vec![DataType::Utf8, DataType::Int64],
 /// )?;
 ///
+/// let flat_metadata = CompoundFlatIndexMetadata::new(
+///     schema.columns().to_vec(),
+///     schema.data_types().to_vec(),
+/// )?;
+///
 /// train_compound_btree_index(
 ///     sorted_data_stream,
-///     &CompoundFlatIndexMetadata::new(schema.columns().to_vec(), schema.data_types().to_vec()),
-///     &index_store,
+///     &flat_metadata,
+///     index_store,
 ///     &schema,
 ///     4096,
 ///     None,
 /// ).await?;
+/// # Ok(())
+/// # }
 /// ```
+#[instrument(level = "debug", skip_all)]
 pub async fn train_compound_btree_index(
     batches_source: SendableRecordBatchStream,
     sub_index_trainer: &dyn CompoundBTreeSubIndex,
@@ -984,6 +1025,12 @@ pub async fn train_compound_btree_index(
     batch_size: u64,
     fragment_ids: Option<Vec<u32>>,
 ) -> Result<()> {
+    debug!(
+        "Training compound index with {} columns, batch_size={}",
+        compound_schema.num_columns(),
+        batch_size
+    );
+
     // Create fragment mask for distributed indexing (matches btree.rs pattern)
     let fragment_mask = fragment_ids.as_ref().and_then(|frag_ids| {
         if !frag_ids.is_empty() {
@@ -1091,7 +1138,6 @@ use lance_core::utils::mask::RowAddrTreeMap;
 use lance_datafusion::exec::{execute_plan, LanceExecutionOptions, OneShotExec};
 use roaring::RoaringBitmap;
 use std::any::Any;
-use tracing::debug;
 
 use super::compound::CompoundSargableQuery;
 
@@ -1206,12 +1252,18 @@ impl CompoundBTreeIndex {
     /// * `column_names` - Column names in index order
     /// * `frag_reuse_index` - Optional fragment reuse index for row ID remapping
     /// * `index_cache` - Cache for loaded pages
+    #[instrument(level = "debug", skip_all)]
     pub async fn load(
         store: Arc<dyn IndexStore>,
         column_names: Vec<String>,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
         index_cache: &LanceCache,
     ) -> Result<Arc<Self>> {
+        debug!(
+            "Loading compound index for columns: {:?}",
+            column_names
+        );
+
         // Load the lookup file
         let page_lookup_file = store.open_index_file(COMPOUND_LOOKUP_NAME).await?;
         let num_rows = page_lookup_file.num_rows();
@@ -1232,7 +1284,7 @@ impl CompoundBTreeIndex {
 
         // Create sub_index metadata
         let sub_index =
-            Arc::new(CompoundFlatIndexMetadata::new(column_names.clone(), data_types.clone()));
+            Arc::new(CompoundFlatIndexMetadata::new(column_names.clone(), data_types.clone())?);
 
         Ok(Arc::new(Self {
             columns: column_names,
@@ -1288,6 +1340,7 @@ impl CompoundBTreeIndex {
     }
 
     /// Read a page from storage.
+    #[instrument(level = "debug", skip_all)]
     async fn read_page(
         &self,
         page_number: u32,
@@ -1307,6 +1360,7 @@ impl CompoundBTreeIndex {
     }
 
     /// Search a single page for matching rows.
+    #[instrument(level = "debug", skip_all)]
     async fn search_page(
         &self,
         query: &CompoundSargableQuery,
@@ -1749,6 +1803,7 @@ impl CompoundBTreeIndex {
 // Implement ScalarIndex trait for CompoundBTreeIndex
 #[async_trait]
 impl ScalarIndex for CompoundBTreeIndex {
+    #[instrument(level = "debug", skip_all)]
     async fn search(
         &self,
         query: &dyn AnyQuery,
@@ -2221,7 +2276,7 @@ impl ScalarIndexPlugin for CompoundBTreeIndexPlugin {
         let compound_schema = CompoundIndexSchema::new(column_names.clone(), data_types.clone())?;
 
         // Create flat index metadata for training
-        let flat_metadata = CompoundFlatIndexMetadata::new(column_names.clone(), data_types);
+        let flat_metadata = CompoundFlatIndexMetadata::new(column_names.clone(), data_types)?;
 
         // Train the index
         train_compound_btree_index(
@@ -2660,7 +2715,8 @@ mod tests {
         let metadata = CompoundFlatIndexMetadata::new(
             vec!["tenant_id".to_string(), "timestamp".to_string()],
             vec![DataType::Utf8, DataType::Int64],
-        );
+        )
+        .unwrap();
 
         assert_eq!(metadata.num_columns(), 2);
         assert_eq!(metadata.column_names(), &["tenant_id", "timestamp"]);
@@ -2680,7 +2736,8 @@ mod tests {
         let metadata = CompoundFlatIndexMetadata::new(
             vec!["name".to_string(), "value".to_string()],
             vec![DataType::Utf8, DataType::Int64],
-        );
+        )
+        .unwrap();
 
         // Create a batch with the expected column names + _rowid
         let batch = RecordBatch::try_new(
@@ -2948,7 +3005,8 @@ mod tests {
         let metadata = CompoundFlatIndexMetadata::new(
             vec!["name".to_string(), "value".to_string()],
             vec![DataType::Utf8, DataType::Int64],
-        );
+        )
+        .unwrap();
 
         let batch = RecordBatch::try_new(
             metadata.schema().clone(),
@@ -3362,7 +3420,8 @@ mod tests {
         let data_types = vec![DataType::Utf8, DataType::Utf8];
         let compound_schema =
             CompoundIndexSchema::new(column_names.clone(), data_types.clone()).unwrap();
-        let sub_index = CompoundFlatIndexMetadata::new(column_names.clone(), data_types.clone());
+        let sub_index =
+            CompoundFlatIndexMetadata::new(column_names.clone(), data_types.clone()).unwrap();
 
         let stream = batches_to_stream(vec![initial_batch], sub_index.schema().clone());
 
@@ -3441,7 +3500,8 @@ mod tests {
         let data_types = vec![DataType::Utf8, DataType::Utf8];
         let compound_schema =
             CompoundIndexSchema::new(column_names.clone(), data_types.clone()).unwrap();
-        let sub_index = CompoundFlatIndexMetadata::new(column_names.clone(), data_types.clone());
+        let sub_index =
+            CompoundFlatIndexMetadata::new(column_names.clone(), data_types.clone()).unwrap();
 
         let stream = batches_to_stream(vec![initial_batch], sub_index.schema().clone());
 
@@ -3518,7 +3578,8 @@ mod tests {
         let data_types = vec![DataType::Utf8, DataType::Utf8];
         let compound_schema =
             CompoundIndexSchema::new(column_names.clone(), data_types.clone()).unwrap();
-        let sub_index = CompoundFlatIndexMetadata::new(column_names.clone(), data_types.clone());
+        let sub_index =
+            CompoundFlatIndexMetadata::new(column_names.clone(), data_types.clone()).unwrap();
 
         let stream = batches_to_stream(vec![initial_batch], sub_index.schema().clone());
 
@@ -3582,7 +3643,8 @@ mod tests {
         let data_types = vec![DataType::Utf8, DataType::Utf8];
         let compound_schema =
             CompoundIndexSchema::new(column_names.clone(), data_types.clone()).unwrap();
-        let sub_index = CompoundFlatIndexMetadata::new(column_names.clone(), data_types.clone());
+        let sub_index =
+            CompoundFlatIndexMetadata::new(column_names.clone(), data_types.clone()).unwrap();
 
         let stream = batches_to_stream(vec![initial_batch], sub_index.schema().clone());
 
@@ -3716,16 +3778,17 @@ mod tests {
 
         // Initial data: 3 tenants, each with 2 statuses (6 rows, row IDs 1-6)
         let initial_batch = create_sorted_test_batch(
-            vec!["acme", "acme", "beta", "beta", "gamma", "gamma"],
-            vec!["active", "inactive", "active", "inactive", "active", "inactive"],
-            vec![1, 2, 3, 4, 5, 6],
+            vec!["a", "b", "c", "d"],
+            vec!["active", "active", "inactive", "active"],
+            vec![1, 2, 3, 4],
         );
 
         let column_names = vec!["tenant".to_string(), "status".to_string()];
         let data_types = vec![DataType::Utf8, DataType::Utf8];
         let compound_schema =
             CompoundIndexSchema::new(column_names.clone(), data_types.clone()).unwrap();
-        let sub_index = CompoundFlatIndexMetadata::new(column_names.clone(), data_types.clone());
+        let sub_index =
+            CompoundFlatIndexMetadata::new(column_names.clone(), data_types.clone()).unwrap();
 
         let stream = batches_to_stream(vec![initial_batch], sub_index.schema().clone());
 
@@ -3934,7 +3997,8 @@ mod tests {
         let data_types = vec![DataType::Utf8, DataType::Utf8];
         let compound_schema =
             CompoundIndexSchema::new(column_names.clone(), data_types.clone()).unwrap();
-        let sub_index = CompoundFlatIndexMetadata::new(column_names.clone(), data_types.clone());
+        let sub_index =
+            CompoundFlatIndexMetadata::new(column_names.clone(), data_types.clone()).unwrap();
 
         let stream = batches_to_stream(vec![initial_batch], sub_index.schema().clone());
 

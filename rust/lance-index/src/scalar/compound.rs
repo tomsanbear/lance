@@ -19,11 +19,18 @@
 //! - NULLS FIRST ordering to match Lance's existing behavior
 //! - Column limits: 2-8 columns (soft limit)
 //! - Per-column statistics for flexible query pruning (implemented in later milestones)
+//!
+//! # See Also
+//!
+//! - [`compound_btree`](super::compound_btree): Index training, storage, and search implementation
+//! - [`btree`](super::btree): Single-column BTree index (similar architecture)
 
-use std::any::Any;
-use std::cmp::Ordering;
-use std::collections::HashSet;
-use std::ops::Bound;
+use std::{
+    any::Any,
+    cmp::Ordering,
+    collections::HashSet,
+    ops::Bound,
+};
 
 use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_row::{OwnedRow, RowConverter, Rows, SortField};
@@ -70,15 +77,23 @@ pub const COMPOUND_SORT_OPTIONS: SortOptions = SortOptions {
 ///
 /// # Example
 ///
-/// ```ignore
-/// use lance_index::scalar::compound::{CompoundIndexSchema, CompoundKey};
-/// use arrow_schema::DataType;
-///
+/// ```
+/// # use lance_index::scalar::compound::{CompoundIndexSchema, CompoundKey};
+/// # use arrow_schema::DataType;
+/// # use std::sync::Arc;
+/// # use arrow_array::{StringArray, Int64Array, ArrayRef};
+/// # fn main() -> lance_core::Result<()> {
 /// let schema = CompoundIndexSchema::new(
 ///     vec!["tenant_id".to_string(), "timestamp".to_string()],
 ///     vec![DataType::Utf8, DataType::Int64],
 /// )?;
 /// let converter = schema.row_converter()?;
+///
+/// // Create arrays for the columns
+/// let arrays: Vec<ArrayRef> = vec![
+///     Arc::new(StringArray::from(vec!["tenant_a", "tenant_b"])),
+///     Arc::new(Int64Array::from(vec![100, 200])),
+/// ];
 ///
 /// // Create keys from arrays
 /// let key1 = CompoundKey::from_arrays(&converter, &arrays, 0)?;
@@ -86,6 +101,8 @@ pub const COMPOUND_SORT_OPTIONS: SortOptions = SortOptions {
 ///
 /// // Keys can be compared directly
 /// assert!(key1 < key2);
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone, Eq)]
 pub struct CompoundKey {
@@ -258,10 +275,10 @@ impl std::hash::Hash for CompoundKey {
 ///
 /// # Example
 ///
-/// ```ignore
-/// use lance_index::scalar::compound::CompoundIndexSchema;
-/// use arrow_schema::DataType;
-///
+/// ```
+/// # use lance_index::scalar::compound::CompoundIndexSchema;
+/// # use arrow_schema::DataType;
+/// # fn main() -> lance_core::Result<()> {
 /// let schema = CompoundIndexSchema::new(
 ///     vec!["tenant_id".to_string(), "status".to_string(), "timestamp".to_string()],
 ///     vec![DataType::Utf8, DataType::Utf8, DataType::Int64],
@@ -269,6 +286,8 @@ impl std::hash::Hash for CompoundKey {
 ///
 /// // Create a RowConverter for key comparison
 /// let converter = schema.row_converter()?;
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone)]
 pub struct CompoundIndexSchema {
@@ -1372,5 +1391,122 @@ mod tests {
             Bound::Excluded(key),
         );
         assert!(query4.has_range());
+    }
+
+    // ========================================================================
+    // Property-Based Tests
+    // ========================================================================
+
+    proptest::proptest! {
+        /// Property: CompoundKey ordering is total and consistent.
+        ///
+        /// For any three keys a, b, c:
+        /// - Reflexive: a == a
+        /// - Antisymmetric: if a <= b and b <= a, then a == b
+        /// - Transitive: if a <= b and b <= c, then a <= c
+        #[test]
+        fn test_compound_key_ordering_is_total(
+            val1 in proptest::option::of(-1000i64..1000i64),
+            val2 in proptest::option::of(-1000i64..1000i64),
+            val3 in proptest::option::of(-1000i64..1000i64),
+        ) {
+            let (_schema, converter) = create_test_schema(
+                vec!["a", "b"],
+                vec![DataType::Int64, DataType::Int64],
+            ).unwrap();
+
+            let key1 = CompoundKey::from_scalars(&converter, &[
+                ScalarValue::Int64(val1),
+                ScalarValue::Int64(val2),
+            ]).unwrap();
+
+            let key2 = CompoundKey::from_scalars(&converter, &[
+                ScalarValue::Int64(val2),
+                ScalarValue::Int64(val3),
+            ]).unwrap();
+
+            let key3 = CompoundKey::from_scalars(&converter, &[
+                ScalarValue::Int64(val1),
+                ScalarValue::Int64(val3),
+            ]).unwrap();
+
+            // Reflexive: a == a
+            proptest::prop_assert_eq!(key1.cmp(&key1), Ordering::Equal);
+            proptest::prop_assert_eq!(key2.cmp(&key2), Ordering::Equal);
+            proptest::prop_assert_eq!(key3.cmp(&key3), Ordering::Equal);
+
+            // Total ordering: exactly one of <, =, > holds
+            let cmp12 = key1.cmp(&key2);
+            let cmp21 = key2.cmp(&key1);
+            proptest::prop_assert_eq!(cmp12, cmp21.reverse());
+
+            // Antisymmetric check
+            if cmp12 == Ordering::Equal {
+                proptest::prop_assert_eq!(key1, key2);
+            }
+        }
+
+        /// Property: Hash consistency with equality.
+        ///
+        /// If two keys are equal, their hashes must be equal.
+        #[test]
+        fn test_compound_key_hash_consistent_with_eq(
+            val1 in proptest::option::of(-1000i64..1000i64),
+            val2 in proptest::option::of(-1000i64..1000i64),
+        ) {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+
+            let (_schema, converter) = create_test_schema(
+                vec!["a", "b"],
+                vec![DataType::Int64, DataType::Int64],
+            ).unwrap();
+
+            let key1 = CompoundKey::from_scalars(&converter, &[
+                ScalarValue::Int64(val1),
+                ScalarValue::Int64(val2),
+            ]).unwrap();
+
+            let key2 = CompoundKey::from_scalars(&converter, &[
+                ScalarValue::Int64(val1),
+                ScalarValue::Int64(val2),
+            ]).unwrap();
+
+            // Keys with same values should be equal and have same hash
+            proptest::prop_assert_eq!(&key1, &key2);
+
+            let mut h1 = DefaultHasher::new();
+            let mut h2 = DefaultHasher::new();
+            key1.hash(&mut h1);
+            key2.hash(&mut h2);
+            proptest::prop_assert_eq!(h1.finish(), h2.finish());
+        }
+
+        /// Property: NULL handling follows NULLS FIRST semantics.
+        ///
+        /// For the first column (primary sort key):
+        /// - NULL values should come before all non-NULL values
+        #[test]
+        fn test_compound_key_nulls_first(
+            non_null_val in -1000i64..1000i64,
+        ) {
+            let (_schema, converter) = create_test_schema(
+                vec!["a", "b"],
+                vec![DataType::Int64, DataType::Int64],
+            ).unwrap();
+
+            let null_key = CompoundKey::from_scalars(&converter, &[
+                ScalarValue::Int64(None),
+                ScalarValue::Int64(Some(0)),
+            ]).unwrap();
+
+            let non_null_key = CompoundKey::from_scalars(&converter, &[
+                ScalarValue::Int64(Some(non_null_val)),
+                ScalarValue::Int64(Some(0)),
+            ]).unwrap();
+
+            // NULL should be less than any non-NULL value (NULLS FIRST)
+            proptest::prop_assert_eq!(null_key.cmp(&non_null_key), Ordering::Less);
+        }
     }
 }

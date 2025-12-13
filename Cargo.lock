@@ -4798,6 +4798,7 @@ dependencies = [
  "num-traits",
  "object_store",
  "pprof",
+ "proptest",
  "prost",
  "prost-build",
  "prost-types",
