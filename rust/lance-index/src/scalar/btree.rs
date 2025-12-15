@@ -28,6 +28,7 @@ use crate::{Index, IndexType};
 use arrow_arith::numeric::add;
 use arrow_array::{new_empty_array, Array, RecordBatch, UInt32Array};
 use arrow_schema::{DataType, Field, Schema, SortOptions};
+use arrow_select::take;
 use async_trait::async_trait;
 use datafusion::physical_plan::{
     sorts::sort_preserving_merge::SortPreservingMergeExec, stream::RecordBatchStreamAdapter,
@@ -1246,6 +1247,14 @@ impl BTreeIndex {
     }
 
     /// Create a stream of all the data in the index, in the same format used to train the index
+    ///
+    /// Returns a stream of (value, row_id) pairs. **Order is not guaranteed** - pages are
+    /// read in file order with parallel I/O for maximum throughput.
+    ///
+    /// This method is optimized for bulk operations like index verification, rebuilding,
+    /// or statistics collection where order doesn't matter and throughput is critical.
+    ///
+    /// For queries that require sorted results (e.g., ORDER BY), use [`Self::into_sorted_data_stream`] instead.
     async fn into_data_stream(self) -> Result<SendableRecordBatchStream> {
         let lazy_reader = LazyIndexReader::new(self.store.clone(), self.ranges_to_files.clone());
         let reader = lazy_reader.get().await?;
@@ -1263,6 +1272,219 @@ impl BTreeIndex {
                 .unwrap()
             })
             .boxed();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            new_schema_clone,
+            batches,
+        )))
+    }
+
+    /// Create a stream of data from the index in sorted order
+    ///
+    /// Returns a stream of (value, row_id) pairs **in sorted order by value**.
+    /// Pages are read sequentially in sorted order, making this suitable for:
+    /// - ORDER BY queries with early termination (consumer can break when done)
+    /// - Range scans that require sorted results
+    /// - Top-K queries (ORDER BY ... LIMIT N)
+    ///
+    /// # Backpressure Handling
+    ///
+    /// This method uses sequential I/O to preserve order and respond to backpressure.
+    /// If the consumer stops reading (e.g., after collecting enough rows for a LIMIT clause),
+    /// the stream will automatically stop reading subsequent pages, avoiding unnecessary I/O.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use lance_index::scalar::btree::BTreeIndex;
+    /// # use futures::stream::StreamExt;
+    /// # async fn example(btree: BTreeIndex) -> lance_core::Result<()> {
+    /// use futures::pin_mut;
+    /// use futures::stream::TryStreamExt;
+    ///
+    /// // Get sorted stream
+    /// let stream = btree.into_sorted_data_stream().await?;
+    /// pin_mut!(stream);
+    ///
+    /// // Consume only what we need (e.g., LIMIT 100)
+    /// let mut count = 0;
+    /// while let Some(batch) = stream.try_next().await? {
+    ///     // Process batch...
+    ///     count += batch.num_rows();
+    ///     if count >= 100 {
+    ///         break;  // Stream drop prevents reading more pages
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Performance
+    ///
+    /// For bulk operations where order doesn't matter, use [`Self::into_data_stream`] instead,
+    /// which uses parallel I/O for higher throughput.
+    pub async fn into_sorted_data_stream(self) -> Result<SendableRecordBatchStream> {
+        let reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
+        let schema = self.sub_index.schema().clone();
+        let value_field = schema.field(0).clone().with_name(VALUE_COLUMN_NAME);
+        let row_id_field = schema.field(1).clone().with_name(ROW_ID);
+        let new_schema = Arc::new(Schema::new(vec![value_field, row_id_field]));
+        let new_schema_clone = new_schema.clone();
+
+        // Collect page numbers in sorted order by iterating the BTreeMap
+        // The BTreeMap is sorted by MIN value, and pages with the same MIN
+        // are in file order, which equals creation order from the sorted input stream
+        let mut sorted_pages = Vec::new();
+        for (_min_value, page_records) in self.page_lookup.tree.iter() {
+            for page_record in page_records {
+                sorted_pages.push(page_record.page_number);
+            }
+        }
+
+        // Create a stream that reads pages in sorted order
+        let reader = Arc::new(reader);
+        let batch_size = self.batch_size;
+
+        let page_stream = stream::iter(sorted_pages.into_iter().map(move |page_num| {
+            let reader = reader.clone();
+            async move {
+                reader.read_record_batch(page_num as u64, batch_size).await
+            }
+        }));
+
+        let batches = page_stream
+            .buffered(1)  // Sequential processing to preserve order and respond to backpressure
+            .map_err(DataFusionError::from)
+            .map_ok(move |batch| {
+                RecordBatch::try_new(
+                    new_schema.clone(),
+                    vec![batch.column(0).clone(), batch.column(1).clone()],
+                )
+                .unwrap()
+            })
+            .boxed();
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            new_schema_clone,
+            batches,
+        )))
+    }
+
+    /// Create a stream of data from the index in reverse sorted order (descending)
+    ///
+    /// Returns a stream of (value, row_id) pairs **in reverse sorted order by value** (largest to smallest).
+    /// Pages are read sequentially in reverse sorted order, making this suitable for:
+    /// - ORDER BY ... DESC queries with early termination
+    /// - Reverse range scans
+    /// - Top-K queries with descending sort (ORDER BY ... DESC LIMIT N)
+    ///
+    /// # Backpressure Handling
+    ///
+    /// This method uses sequential I/O to preserve order and respond to backpressure.
+    /// If the consumer stops reading (e.g., after collecting enough rows for a LIMIT clause),
+    /// the stream will automatically stop reading subsequent pages, avoiding unnecessary I/O.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use lance_index::scalar::btree::BTreeIndex;
+    /// # use futures::stream::StreamExt;
+    /// # async fn example(btree: BTreeIndex) -> lance_core::Result<()> {
+    /// use futures::pin_mut;
+    /// use futures::stream::TryStreamExt;
+    ///
+    /// // Get reverse sorted stream (largest values first)
+    /// let stream = btree.into_reverse_sorted_data_stream().await?;
+    /// pin_mut!(stream);
+    ///
+    /// // Consume only what we need (e.g., ORDER BY col DESC LIMIT 100)
+    /// let mut count = 0;
+    /// while let Some(batch) = stream.try_next().await? {
+    ///     // Process batch...
+    ///     count += batch.num_rows();
+    ///     if count >= 100 {
+    ///         break;  // Stream drop prevents reading more pages
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Performance
+    ///
+    /// Uses the same sequential I/O pattern as [`Self::into_sorted_data_stream`], but traverses
+    /// the BTreeMap in reverse order to produce descending results.
+    pub async fn into_reverse_sorted_data_stream(self) -> Result<SendableRecordBatchStream> {
+        let reader = self.store.open_index_file(BTREE_PAGES_NAME).await?;
+        let schema = self.sub_index.schema().clone();
+        let value_field = schema.field(0).clone().with_name(VALUE_COLUMN_NAME);
+        let row_id_field = schema.field(1).clone().with_name(ROW_ID);
+        let new_schema = Arc::new(Schema::new(vec![value_field, row_id_field]));
+        let new_schema_clone = new_schema.clone();
+
+        // Collect page numbers in reverse sorted order by iterating the BTreeMap backwards
+        // The BTreeMap is sorted by MIN value, so .rev() gives us largest MIN values first
+        let mut sorted_pages = Vec::new();
+        for (_min_value, page_records) in self.page_lookup.tree.iter().rev() {
+            // Within each MIN value group, reverse the pages as well
+            for page_record in page_records.iter().rev() {
+                sorted_pages.push(page_record.page_number);
+            }
+        }
+
+        // Create a stream that reads pages in reverse sorted order
+        let reader = Arc::new(reader);
+        let batch_size = self.batch_size;
+
+        let page_stream = stream::iter(sorted_pages.into_iter().map(move |page_num| {
+            let reader = reader.clone();
+            async move {
+                reader.read_record_batch(page_num as u64, batch_size).await
+            }
+        }));
+
+        let batches = page_stream
+            .buffered(1)  // Sequential processing to preserve order and respond to backpressure
+            .map_err(DataFusionError::from)
+            .map_ok(move |batch| {
+                // Reverse the rows within this batch for true DESC ordering
+                // Each batch is internally sorted ASC, so we need to reverse it
+                let num_rows = batch.num_rows();
+                if num_rows == 0 {
+                    return RecordBatch::try_new(
+                        new_schema.clone(),
+                        vec![batch.column(0).clone(), batch.column(1).clone()],
+                    )
+                    .unwrap();
+                }
+
+                // Create reversed indices: [n-1, n-2, ..., 1, 0]
+                let reversed_indices: UInt32Array = (0..num_rows)
+                    .rev()
+                    .map(|i| i as u32)
+                    .collect();
+
+                // Take rows in reversed order
+                let reversed_col0 = take::take(
+                    batch.column(0).as_ref(),
+                    &reversed_indices,
+                    None,
+                )
+                .unwrap();
+                let reversed_col1 = take::take(
+                    batch.column(1).as_ref(),
+                    &reversed_indices,
+                    None,
+                )
+                .unwrap();
+
+                RecordBatch::try_new(
+                    new_schema.clone(),
+                    vec![reversed_col0, reversed_col1],
+                )
+                .unwrap()
+            })
+            .boxed();
+
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             new_schema_clone,
             batches,
@@ -2359,6 +2581,7 @@ impl Stream for IndexReaderStream {
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         let this = self.get_mut();
+
         if this.batch_idx >= this.num_batches {
             return std::task::Poll::Ready(None);
         }
@@ -2366,6 +2589,7 @@ impl Stream for IndexReaderStream {
         this.batch_idx += 1;
         let reader_copy = this.reader.clone();
         let batch_size = this.batch_size;
+
         let read_task = async move {
             reader_copy
                 .read_record_batch(batch_num as u64, batch_size)
