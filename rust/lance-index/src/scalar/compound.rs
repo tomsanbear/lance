@@ -485,6 +485,51 @@ pub enum CompoundSargableQuery {
         lower: Bound<CompoundKey>,
         upper: Bound<CompoundKey>,
     },
+
+    /// IN-list query on the first column.
+    ///
+    /// Returns all rows where the first column matches any value in the list.
+    /// This is equivalent to multiple prefix lookups OR'd together.
+    ///
+    /// Example: `WHERE tenant_id IN ('acme', 'beta', 'gamma')`
+    ///
+    /// Note: IN-list on non-first columns is not supported as it would require
+    /// scanning all prefixes (defeating the purpose of the compound index).
+    FirstColumnIn(Vec<ScalarValue>),
+
+    /// IN-list query after a prefix of equality predicates.
+    ///
+    /// Returns all rows where the prefix columns match exactly and the next column
+    /// matches any value in the IN-list.
+    ///
+    /// Example: `WHERE tenant_id = 'acme' AND status IN ('active', 'pending')`
+    ///
+    /// This is more efficient than FirstColumnIn when there's a leading equality
+    /// predicate, as it narrows the search space to rows matching the prefix first.
+    PrefixIn {
+        /// Equality predicates for prefix columns (in index order).
+        /// Must have at least one value.
+        prefix: Vec<ScalarValue>,
+        /// Values to match in the next column after the prefix.
+        in_values: Vec<ScalarValue>,
+    },
+
+    /// IS NULL query after a prefix of equality predicates.
+    ///
+    /// Returns all rows where the prefix columns match exactly and the next column
+    /// is NULL.
+    ///
+    /// Example: `WHERE tenant_id = 'acme' AND deleted_at IS NULL`
+    ///
+    /// This is useful for soft-delete patterns where you want to find non-deleted
+    /// records for a specific tenant.
+    PrefixIsNull {
+        /// Equality predicates for prefix columns (in index order).
+        /// Must have at least one value.
+        prefix: Vec<ScalarValue>,
+        /// The column index (after prefix) that should be NULL.
+        null_column_idx: usize,
+    },
 }
 
 impl CompoundSargableQuery {
@@ -526,12 +571,16 @@ impl CompoundSargableQuery {
     ///
     /// For `FullKeyLookup`, returns the total number of columns.
     /// For `PrefixLookup`, returns the prefix length.
-    /// For `Range`, returns 0 (no specific prefix).
+    /// For `Range` and `FirstColumnIn`, returns 0 (no specific prefix).
+    /// For `PrefixIn` and `PrefixIsNull`, returns the prefix length.
     pub fn prefix_length(&self) -> usize {
         match self {
             Self::FullKeyLookup(_) => 0, // Full key, not a prefix
             Self::PrefixLookup { prefix, .. } => prefix.len(),
             Self::Range { .. } => 0,
+            Self::FirstColumnIn(_) => 0, // IN-list on first column, not a prefix
+            Self::PrefixIn { prefix, .. } => prefix.len(),
+            Self::PrefixIsNull { prefix, .. } => prefix.len(),
         }
     }
 
@@ -541,7 +590,39 @@ impl CompoundSargableQuery {
             Self::FullKeyLookup(_) => false,
             Self::PrefixLookup { range, .. } => range.is_some(),
             Self::Range { .. } => true,
+            Self::FirstColumnIn(_) => false, // IN-list is not a range
+            Self::PrefixIn { .. } => false,  // IN-list is not a range
+            Self::PrefixIsNull { .. } => false, // IS NULL is not a range
         }
+    }
+
+    /// Create an IN-list query on the first column.
+    ///
+    /// # Arguments
+    ///
+    /// * `values` - The list of values to match against the first column
+    pub fn first_column_in(values: Vec<ScalarValue>) -> Self {
+        Self::FirstColumnIn(values)
+    }
+
+    /// Create an IN-list query after a prefix of equality predicates.
+    ///
+    /// # Arguments
+    ///
+    /// * `prefix` - Equality predicates for leading columns
+    /// * `in_values` - Values to match in the next column after the prefix
+    pub fn prefix_in(prefix: Vec<ScalarValue>, in_values: Vec<ScalarValue>) -> Self {
+        Self::PrefixIn { prefix, in_values }
+    }
+
+    /// Create an IS NULL query after a prefix of equality predicates.
+    ///
+    /// # Arguments
+    ///
+    /// * `prefix` - Equality predicates for leading columns
+    /// * `null_column_idx` - The column index (after prefix) that should be NULL
+    pub fn prefix_is_null(prefix: Vec<ScalarValue>, null_column_idx: usize) -> Self {
+        Self::PrefixIsNull { prefix, null_column_idx }
     }
 }
 
@@ -583,6 +664,37 @@ impl AnyQuery for CompoundSargableQuery {
                 };
                 format!("{} {} range: {}, {}", col, col, lower_str, upper_str)
             }
+            Self::FirstColumnIn(values) => {
+                let values_str = values
+                    .iter()
+                    .map(|v| format!("{}", v))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{}[0] IN ({})", col, values_str)
+            }
+            Self::PrefixIn { prefix, in_values } => {
+                let prefix_str = prefix
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| format!("col{}={}", i, v))
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                let in_values_str = in_values
+                    .iter()
+                    .map(|v| format!("{}", v))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("{} AND col{} IN ({})", prefix_str, prefix.len(), in_values_str)
+            }
+            Self::PrefixIsNull { prefix, null_column_idx } => {
+                let prefix_str = prefix
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| format!("col{}={}", i, v))
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                format!("{} AND col{} IS NULL", prefix_str, prefix.len() + null_column_idx)
+            }
         }
     }
 
@@ -623,6 +735,74 @@ impl AnyQuery for CompoundSargableQuery {
             Self::Range { .. } => {
                 // Range on compound key - return placeholder
                 Expr::Column(Column::new_unqualified(col))
+            }
+            Self::FirstColumnIn(values) => {
+                // Build IN list expression for the first column
+                let col_expr = Expr::Column(Column::new_unqualified(format!("{}_0", col)));
+                let list = values
+                    .iter()
+                    .map(|v| Expr::Literal(v.clone(), None))
+                    .collect();
+                Expr::InList(datafusion_expr::expr::InList {
+                    expr: Box::new(col_expr),
+                    list,
+                    negated: false,
+                })
+            }
+            Self::PrefixIn { prefix, in_values } => {
+                // Build AND expression for prefix + IN list on next column
+                if prefix.is_empty() {
+                    // No prefix, just IN list on first column
+                    let col_expr = Expr::Column(Column::new_unqualified(format!("{}_0", col)));
+                    let list = in_values
+                        .iter()
+                        .map(|v| Expr::Literal(v.clone(), None))
+                        .collect();
+                    return Expr::InList(datafusion_expr::expr::InList {
+                        expr: Box::new(col_expr),
+                        list,
+                        negated: false,
+                    });
+                }
+
+                let mut expr = Expr::Literal(ScalarValue::Boolean(Some(true)), None);
+                for (i, val) in prefix.iter().enumerate() {
+                    let col_expr = Expr::Column(Column::new_unqualified(format!("{}_{}", col, i)));
+                    let eq_expr = col_expr.eq(Expr::Literal(val.clone(), None));
+                    expr = expr.and(eq_expr);
+                }
+
+                // Add IN list for the column after prefix
+                let in_col = Expr::Column(Column::new_unqualified(format!("{}_{}", col, prefix.len())));
+                let list = in_values
+                    .iter()
+                    .map(|v| Expr::Literal(v.clone(), None))
+                    .collect();
+                let in_expr = Expr::InList(datafusion_expr::expr::InList {
+                    expr: Box::new(in_col),
+                    list,
+                    negated: false,
+                });
+                expr.and(in_expr)
+            }
+            Self::PrefixIsNull { prefix, null_column_idx } => {
+                // Build AND expression for prefix + IS NULL on specified column
+                if prefix.is_empty() {
+                    // No prefix, just IS NULL on first column
+                    let col_expr = Expr::Column(Column::new_unqualified(format!("{}_{}", col, null_column_idx)));
+                    return col_expr.is_null();
+                }
+
+                let mut expr = Expr::Literal(ScalarValue::Boolean(Some(true)), None);
+                for (i, val) in prefix.iter().enumerate() {
+                    let col_expr = Expr::Column(Column::new_unqualified(format!("{}_{}", col, i)));
+                    let eq_expr = col_expr.eq(Expr::Literal(val.clone(), None));
+                    expr = expr.and(eq_expr);
+                }
+
+                // Add IS NULL for the column after prefix
+                let null_col = Expr::Column(Column::new_unqualified(format!("{}_{}", col, prefix.len() + null_column_idx)));
+                expr.and(null_col.is_null())
             }
         }
     }

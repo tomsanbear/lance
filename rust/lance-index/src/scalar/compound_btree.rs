@@ -559,6 +559,65 @@ impl CompoundBTreeLookup {
                 let _ = (lower, upper);
                 false
             }
+            CompoundSargableQuery::FirstColumnIn(values) => {
+                // For IN-list on first column, prune if page's first column bounds
+                // don't overlap with any of the values in the list.
+                // A page can be pruned if ALL values fall outside the page's bounds.
+                if self.num_columns == 0 {
+                    return false;
+                }
+
+                // If any value could be in this page, don't prune
+                for value in values {
+                    if !self.can_prune_by_equality(stats, 0, value) {
+                        return false; // This value might be in this page
+                    }
+                }
+
+                // All values would be pruned - safe to prune this page
+                true
+            }
+            CompoundSargableQuery::PrefixIn { prefix, in_values } => {
+                // First check prefix columns for pruning
+                for (col_idx, value) in prefix.iter().enumerate() {
+                    if self.can_prune_by_equality(stats, col_idx, value) {
+                        return true;
+                    }
+                }
+
+                // Then check IN-list on next column
+                let in_col_idx = prefix.len();
+                if in_col_idx >= self.num_columns {
+                    return false;
+                }
+
+                // Can prune if ALL in_values fall outside the page's bounds for this column
+                for value in in_values {
+                    if !self.can_prune_by_equality(stats, in_col_idx, value) {
+                        return false; // This value might be in this page
+                    }
+                }
+
+                // All IN-list values would be pruned
+                true
+            }
+            CompoundSargableQuery::PrefixIsNull { prefix, null_column_idx } => {
+                // First check prefix columns for pruning
+                for (col_idx, value) in prefix.iter().enumerate() {
+                    if self.can_prune_by_equality(stats, col_idx, value) {
+                        return true;
+                    }
+                }
+
+                // Then check if the null column has any nulls
+                let target_col_idx = prefix.len() + null_column_idx;
+                if target_col_idx >= self.num_columns {
+                    return false;
+                }
+
+                // Can prune if the column has no null values in this page
+                stats.null_counts[target_col_idx] == 0
+            }
         }
     }
 
@@ -1384,7 +1443,197 @@ impl CompoundBTreeIndex {
                 self.search_prefix(batch, prefix, range.as_ref())
             }
             CompoundSargableQuery::Range { lower, upper } => self.search_range(batch, lower, upper),
+            CompoundSargableQuery::FirstColumnIn(values) => {
+                self.search_first_column_in(batch, values)
+            }
+            CompoundSargableQuery::PrefixIn { prefix, in_values } => {
+                self.search_prefix_in(batch, prefix, in_values)
+            }
+            CompoundSargableQuery::PrefixIsNull { prefix, null_column_idx } => {
+                self.search_prefix_is_null(batch, prefix, *null_column_idx)
+            }
         }
+    }
+
+    /// Search for rows where the first column matches any value in the list.
+    fn search_first_column_in(
+        &self,
+        batch: &RecordBatch,
+        values: &[ScalarValue],
+    ) -> Result<RowAddrTreeMap> {
+        // Get the first column
+        let first_col_name = self.columns.first().ok_or_else(|| Error::Index {
+            message: "Compound index has no columns".to_string(),
+            location: location!(),
+        })?;
+
+        let first_col = batch.column_by_name(first_col_name).ok_or_else(|| Error::Index {
+            message: format!("First column '{}' not found in batch", first_col_name),
+            location: location!(),
+        })?;
+
+        let row_id_col = batch
+            .column_by_name(COMPOUND_IDS_COLUMN)
+            .ok_or_else(|| Error::Index {
+                message: "Row ID column not found in batch".to_string(),
+                location: location!(),
+            })?
+            .as_primitive::<UInt64Type>();
+
+        // For each value, find matching rows and union the results
+        let mut result = RowAddrTreeMap::new();
+
+        for value in values {
+            // Use Datum trait for scalar comparison - this broadcasts the scalar to match array length
+            let eq_result =
+                arrow_ord::cmp::eq(&first_col, &value.to_scalar().map_err(|e| Error::Index {
+                    message: format!("Failed to convert to scalar: {}", e),
+                    location: location!(),
+                })?)
+                .map_err(|e| Error::Index {
+                    message: format!("Failed to compare arrays: {}", e),
+                    location: location!(),
+                })?;
+
+            // Collect matching row IDs
+            for (idx, is_match) in eq_result.iter().enumerate() {
+                if is_match == Some(true) {
+                    let row_id = row_id_col.value(idx);
+                    result.insert(row_id.into());
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Search for rows where prefix columns match exactly and the next column
+    /// matches any value in the IN-list.
+    fn search_prefix_in(
+        &self,
+        batch: &RecordBatch,
+        prefix: &[ScalarValue],
+        in_values: &[ScalarValue],
+    ) -> Result<RowAddrTreeMap> {
+        let row_id_col = batch
+            .column_by_name(COMPOUND_IDS_COLUMN)
+            .ok_or_else(|| Error::Index {
+                message: "Row ID column not found in batch".to_string(),
+                location: location!(),
+            })?
+            .as_primitive::<UInt64Type>();
+
+        let mut result = RowAddrTreeMap::new();
+
+        // Check each row against prefix + IN-list predicates
+        for row_idx in 0..batch.num_rows() {
+            let mut matches_prefix = true;
+
+            // Check prefix columns for equality
+            for (col_idx, expected_value) in prefix.iter().enumerate() {
+                let col = batch.column_by_name(&self.columns[col_idx]).ok_or_else(|| Error::Index {
+                    message: format!("Missing column {} in page", self.columns[col_idx]),
+                    location: location!(),
+                })?;
+
+                let actual_value = ScalarValue::try_from_array(col, row_idx).map_err(|e| Error::Index {
+                    message: format!("Failed to get value at row {}: {}", row_idx, e),
+                    location: location!(),
+                })?;
+
+                if actual_value != *expected_value {
+                    matches_prefix = false;
+                    break;
+                }
+            }
+
+            // Check IN-list on next column if prefix matched
+            if matches_prefix {
+                let in_col_idx = prefix.len();
+                if in_col_idx < self.columns.len() {
+                    let col = batch.column_by_name(&self.columns[in_col_idx]).ok_or_else(|| Error::Index {
+                        message: format!("Missing column {} in page", self.columns[in_col_idx]),
+                        location: location!(),
+                    })?;
+
+                    let actual_value = ScalarValue::try_from_array(col, row_idx).map_err(|e| Error::Index {
+                        message: format!("Failed to get value at row {}: {}", row_idx, e),
+                        location: location!(),
+                    })?;
+
+                    // Check if the value matches any in the IN-list
+                    let matches_in_list = in_values.iter().any(|v| *v == actual_value);
+                    if matches_in_list {
+                        result.insert(row_id_col.value(row_idx));
+                    }
+                } else {
+                    // No column to check IN-list on, but prefix matched
+                    result.insert(row_id_col.value(row_idx));
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Search for rows where prefix columns match exactly and the specified
+    /// column is NULL.
+    fn search_prefix_is_null(
+        &self,
+        batch: &RecordBatch,
+        prefix: &[ScalarValue],
+        null_column_idx: usize,
+    ) -> Result<RowAddrTreeMap> {
+        let row_id_col = batch
+            .column_by_name(COMPOUND_IDS_COLUMN)
+            .ok_or_else(|| Error::Index {
+                message: "Row ID column not found in batch".to_string(),
+                location: location!(),
+            })?
+            .as_primitive::<UInt64Type>();
+
+        let mut result = RowAddrTreeMap::new();
+
+        // The target NULL column index
+        let target_col_idx = prefix.len() + null_column_idx;
+
+        // Check each row against prefix + IS NULL predicates
+        for row_idx in 0..batch.num_rows() {
+            let mut matches_prefix = true;
+
+            // Check prefix columns for equality
+            for (col_idx, expected_value) in prefix.iter().enumerate() {
+                let col = batch.column_by_name(&self.columns[col_idx]).ok_or_else(|| Error::Index {
+                    message: format!("Missing column {} in page", self.columns[col_idx]),
+                    location: location!(),
+                })?;
+
+                let actual_value = ScalarValue::try_from_array(col, row_idx).map_err(|e| Error::Index {
+                    message: format!("Failed to get value at row {}: {}", row_idx, e),
+                    location: location!(),
+                })?;
+
+                if actual_value != *expected_value {
+                    matches_prefix = false;
+                    break;
+                }
+            }
+
+            // Check IS NULL on target column if prefix matched
+            if matches_prefix && target_col_idx < self.columns.len() {
+                let col = batch.column_by_name(&self.columns[target_col_idx]).ok_or_else(|| Error::Index {
+                    message: format!("Missing column {} in page", self.columns[target_col_idx]),
+                    location: location!(),
+                })?;
+
+                // Check if the value is NULL
+                if col.is_null(row_idx) {
+                    result.insert(row_id_col.value(row_idx));
+                }
+            }
+        }
+
+        Ok(result)
     }
 
     /// Search for an exact full key match.
@@ -2029,9 +2278,24 @@ impl ScalarQueryParser for CompoundQueryParser {
         ))
     }
 
-    fn visit_in_list(&self, _column: &str, _in_list: &[ScalarValue]) -> Option<IndexedExpression> {
-        // IN list queries on compound indices are complex - defer for now
-        None
+    fn visit_in_list(&self, column: &str, in_list: &[ScalarValue]) -> Option<IndexedExpression> {
+        // IN-list is only supported on the first column of the compound index
+        if !self.is_first_column(column) {
+            return None;
+        }
+
+        // Filter out NULL values (they require special handling)
+        if in_list.iter().any(|val| val.is_null()) {
+            return None;
+        }
+
+        let query = CompoundSargableQuery::first_column_in(in_list.to_vec());
+
+        Some(IndexedExpression::index_query(
+            column.to_string(),
+            self.index_name.clone(),
+            Arc::new(query),
+        ))
     }
 
     fn visit_is_bool(&self, column: &str, value: bool) -> Option<IndexedExpression> {
@@ -3356,6 +3620,155 @@ mod tests {
         assert!(result.is_none());
     }
 
+    #[test]
+    fn test_compound_query_parser_visit_in_list() {
+        use super::super::expression::ScalarQueryParser;
+
+        let parser = CompoundQueryParser::new(
+            "test_index".to_string(),
+            vec!["tenant_id".to_string(), "status".to_string()],
+            vec![DataType::Utf8, DataType::Utf8],
+        );
+
+        // IN list on first column should work
+        let in_list = vec![
+            ScalarValue::Utf8(Some("alpha".to_string())),
+            ScalarValue::Utf8(Some("beta".to_string())),
+        ];
+        let result = parser.visit_in_list("tenant_id", &in_list);
+        assert!(result.is_some(), "IN list on first column should work");
+
+        // IN list on non-first column should NOT work
+        let result = parser.visit_in_list("status", &in_list);
+        assert!(
+            result.is_none(),
+            "IN list on non-first column should not work"
+        );
+
+        // IN list with NULL value should NOT work
+        let in_list_with_null = vec![
+            ScalarValue::Utf8(Some("alpha".to_string())),
+            ScalarValue::Utf8(None),
+        ];
+        let result = parser.visit_in_list("tenant_id", &in_list_with_null);
+        assert!(result.is_none(), "IN list with NULL value should not work");
+
+        // Empty IN list should work (edge case)
+        let empty_list: Vec<ScalarValue> = vec![];
+        let result = parser.visit_in_list("tenant_id", &empty_list);
+        assert!(result.is_some(), "Empty IN list should work");
+    }
+
+    #[test]
+    fn test_compound_query_parser_visit_between() {
+        use super::super::expression::ScalarQueryParser;
+        use std::ops::Bound;
+
+        let parser = CompoundQueryParser::new(
+            "test_index".to_string(),
+            vec!["tenant_id".to_string(), "timestamp".to_string()],
+            vec![DataType::Utf8, DataType::Int64],
+        );
+
+        // BETWEEN on first column should work
+        let low = Bound::Included(ScalarValue::Utf8(Some("alpha".to_string())));
+        let high = Bound::Included(ScalarValue::Utf8(Some("zeta".to_string())));
+        let result = parser.visit_between("tenant_id", &low, &high);
+        assert!(result.is_some(), "BETWEEN on first column should work");
+
+        // BETWEEN on non-first column should NOT work
+        let low_ts = Bound::Included(ScalarValue::Int64(Some(100)));
+        let high_ts = Bound::Included(ScalarValue::Int64(Some(200)));
+        let result = parser.visit_between("timestamp", &low_ts, &high_ts);
+        assert!(
+            result.is_none(),
+            "BETWEEN on non-first column should not work"
+        );
+
+        // BETWEEN on unknown column should NOT work
+        let result = parser.visit_between("unknown_column", &low, &high);
+        assert!(result.is_none(), "BETWEEN on unknown column should not work");
+    }
+
+    #[test]
+    fn test_compound_query_parser_unknown_column() {
+        use super::super::expression::ScalarQueryParser;
+        use datafusion_expr::Operator;
+
+        let parser = CompoundQueryParser::new(
+            "test_index".to_string(),
+            vec!["tenant_id".to_string(), "status".to_string()],
+            vec![DataType::Utf8, DataType::Utf8],
+        );
+
+        // Comparison on unknown column should NOT work
+        let result = parser.visit_comparison(
+            "unknown_column",
+            &ScalarValue::Utf8(Some("test".to_string())),
+            &Operator::Eq,
+        );
+        assert!(
+            result.is_none(),
+            "Comparison on unknown column should not work"
+        );
+
+        // IS NULL on unknown column should NOT work
+        let result = parser.visit_is_null("unknown_column");
+        assert!(result.is_none(), "IS NULL on unknown column should not work");
+
+        // IN list on unknown column should NOT work
+        let in_list = vec![ScalarValue::Utf8(Some("test".to_string()))];
+        let result = parser.visit_in_list("unknown_column", &in_list);
+        assert!(result.is_none(), "IN list on unknown column should not work");
+    }
+
+    #[test]
+    fn test_compound_query_parser_all_comparison_operators() {
+        use super::super::expression::ScalarQueryParser;
+        use datafusion_expr::Operator;
+
+        let parser = CompoundQueryParser::new(
+            "test_index".to_string(),
+            vec!["value".to_string(), "count".to_string()],
+            vec![DataType::Int64, DataType::Int64],
+        );
+
+        let value = ScalarValue::Int64(Some(100));
+
+        // All comparison operators on first column should work
+        for op in [
+            Operator::Eq,
+            Operator::Lt,
+            Operator::LtEq,
+            Operator::Gt,
+            Operator::GtEq,
+            Operator::NotEq,
+        ] {
+            let result = parser.visit_comparison("value", &value, &op);
+            assert!(
+                result.is_some(),
+                "Operator {:?} on first column should work",
+                op
+            );
+        }
+
+        // Arithmetic operators should NOT work for filtering
+        for op in [
+            Operator::Plus,
+            Operator::Minus,
+            Operator::Multiply,
+            Operator::Divide,
+            Operator::Modulo,
+        ] {
+            let result = parser.visit_comparison("value", &value, &op);
+            assert!(
+                result.is_none(),
+                "Arithmetic operator {:?} should not work for filtering",
+                op
+            );
+        }
+    }
+
     // ========================================================================
     // Integration Tests for Update/Remap
     // ========================================================================
@@ -3776,10 +4189,12 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        // Initial data: 3 tenants, each with 2 statuses (6 rows, row IDs 1-6)
+        // Initial data: 4 tenants with different statuses (4 rows, row IDs 1-4)
+        // Using names that will interleave with "beta" and "delta" when sorted
+        // Sorted order: acme < beta < delta < gamma
         let initial_batch = create_sorted_test_batch(
-            vec!["a", "b", "c", "d"],
-            vec!["active", "active", "inactive", "active"],
+            vec!["acme", "beta", "gamma", "gamma"],
+            vec!["active", "inactive", "active", "inactive"],
             vec![1, 2, 3, 4],
         );
 
@@ -3805,13 +4220,13 @@ mod tests {
         .await
         .unwrap();
 
-        // New data from new fragment (row IDs 7-8) that interleaves with existing data
-        // "delta" sorts between "beta" and "gamma"
-        // Adding another "beta","active" to test duplicate compound keys with different row IDs
+        // New data from new fragment (row IDs 5-6) that interleaves with existing data
+        // "beta","active" adds a new row for existing tenant "beta"
+        // "delta","inactive" adds a new tenant between "beta" and "gamma"
         let new_batch = create_sorted_test_batch(
             vec!["beta", "delta"], // Sorted order
             vec!["active", "inactive"],
-            vec![7, 8], // New row IDs from new fragment
+            vec![5, 6], // New row IDs from new fragment
         );
 
         let new_stream = batches_to_stream(vec![new_batch], sub_index.schema().clone());
@@ -3838,8 +4253,8 @@ mod tests {
         let page_reader = update_store.open_index_file(COMPOUND_PAGES_NAME).await.unwrap();
         let all_data = page_reader.read_record_batch(0, 100).await.unwrap();
 
-        // Should have 8 rows: 6 original + 2 new
-        assert_eq!(all_data.num_rows(), 8);
+        // Should have 6 rows: 4 original + 2 new
+        assert_eq!(all_data.num_rows(), 6);
 
         let _tenant_col = all_data.column(0).as_any().downcast_ref::<StringArray>().unwrap();
         let _status_col = all_data.column(1).as_any().downcast_ref::<StringArray>().unwrap();
@@ -3850,13 +4265,11 @@ mod tests {
 
         // Expected order after merge (sorted by compound key):
         // ("acme", "active", 1)
-        // ("acme", "inactive", 2)
-        // ("beta", "active", 3)
-        // ("beta", "active", 7) - new, same compound key as row 3
-        // ("beta", "inactive", 4)
-        // ("delta", "inactive", 8) - new, sorts between beta and gamma
-        // ("gamma", "active", 5)
-        // ("gamma", "inactive", 6)
+        // ("beta", "active", 5) - new
+        // ("beta", "inactive", 2)
+        // ("delta", "inactive", 6) - new, sorts between beta and gamma
+        // ("gamma", "active", 3)
+        // ("gamma", "inactive", 4)
 
         // Test query for "delta" tenant - should find the new row
         use super::super::compound::CompoundSargableQuery;
@@ -3884,9 +4297,9 @@ mod tests {
             .map(|iter| iter.map(u64::from).collect())
             .unwrap_or_default();
 
-        assert_eq!(found_delta, vec![8], "Should find new row 8 under 'delta'");
+        assert_eq!(found_delta, vec![6], "Should find new row 6 under 'delta'");
 
-        // Test query for ("beta", "active") - should find 2 rows (original + new)
+        // Test query for ("beta", "active") - should find 1 row (the new one)
         let query_beta_active = CompoundSargableQuery::PrefixLookup {
             prefix: vec![
                 ScalarValue::Utf8(Some("beta".to_string())),
@@ -3907,11 +4320,10 @@ mod tests {
             .map(|iter| iter.map(u64::from).collect())
             .unwrap_or_default();
 
-        assert_eq!(found_beta.len(), 2, "Should find 2 rows with (beta, active)");
-        assert!(found_beta.contains(&3), "Should include original row 3");
-        assert!(found_beta.contains(&7), "Should include new row 7");
+        assert_eq!(found_beta.len(), 1, "Should find 1 row with (beta, active)");
+        assert!(found_beta.contains(&5), "Should include new row 5");
 
-        // Test prefix query for just "beta" tenant - should find 3 rows
+        // Test prefix query for just "beta" tenant - should find 2 rows
         let query_beta_prefix = CompoundSargableQuery::PrefixLookup {
             prefix: vec![ScalarValue::Utf8(Some("beta".to_string()))],
             range: None,
@@ -3931,12 +4343,11 @@ mod tests {
 
         assert_eq!(
             found_beta_prefix.len(),
-            3,
-            "Should find 3 rows with tenant 'beta'"
+            2,
+            "Should find 2 rows with tenant 'beta'"
         );
-        assert!(found_beta_prefix.contains(&3), "Should include row 3");
-        assert!(found_beta_prefix.contains(&4), "Should include row 4");
-        assert!(found_beta_prefix.contains(&7), "Should include new row 7");
+        assert!(found_beta_prefix.contains(&2), "Should include row 2 (beta, inactive)");
+        assert!(found_beta_prefix.contains(&5), "Should include new row 5 (beta, active)");
     }
 
     #[tokio::test]
@@ -4143,5 +4554,617 @@ mod tests {
         // Verify second column (status) bounds exist
         let status_bounds = updated_index.global_bounds(1);
         assert!(status_bounds.is_some(), "Should have bounds for status column");
+    }
+
+    #[tokio::test]
+    async fn test_compound_index_first_column_in() {
+        // Test IN-list query on the first column
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Create test data: 5 tenants with 2 statuses each
+        let tenants = vec![
+            "alpha", "alpha", "beta", "beta", "gamma", "gamma", "delta", "delta", "epsilon",
+            "epsilon",
+        ];
+        let statuses = vec![
+            "active", "inactive", "active", "inactive", "active", "inactive", "active", "inactive",
+            "active", "inactive",
+        ];
+        let row_ids: Vec<u64> = (1..=10).collect();
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("col0", DataType::Utf8, true),
+                Field::new("col1", DataType::Utf8, true),
+                Field::new(COMPOUND_IDS_COLUMN, DataType::UInt64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(tenants)) as ArrayRef,
+                Arc::new(StringArray::from(statuses)) as ArrayRef,
+                Arc::new(UInt64Array::from(row_ids)) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let column_names = vec!["tenant".to_string(), "status".to_string()];
+        let data_types = vec![DataType::Utf8, DataType::Utf8];
+        let compound_schema =
+            CompoundIndexSchema::new(column_names.clone(), data_types.clone()).unwrap();
+        let sub_index =
+            CompoundFlatIndexMetadata::new(column_names.clone(), data_types.clone()).unwrap();
+
+        let stream = batches_to_stream(vec![batch], sub_index.schema().clone());
+
+        train_compound_btree_index(
+            stream,
+            &sub_index,
+            store.as_ref(),
+            &compound_schema,
+            DEFAULT_COMPOUND_BATCH_SIZE,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let index = CompoundBTreeIndex::load(
+            store.clone(),
+            column_names.clone(),
+            None,
+            &LanceCache::no_cache(),
+        )
+        .await
+        .unwrap();
+
+        // Test IN-list query: find rows where tenant IN ('alpha', 'gamma')
+        let query = CompoundSargableQuery::FirstColumnIn(vec![
+            ScalarValue::Utf8(Some("alpha".to_string())),
+            ScalarValue::Utf8(Some("gamma".to_string())),
+        ]);
+
+        let result = index
+            .search(&query as &dyn AnyQuery, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        let found: Vec<u64> = result
+            .row_addrs()
+            .true_rows()
+            .row_addrs()
+            .map(|iter| iter.map(u64::from).collect())
+            .unwrap_or_default();
+
+        // alpha has rows 1,2 and gamma has rows 5,6
+        assert_eq!(found.len(), 4, "Should find 4 rows for alpha and gamma");
+        assert!(found.contains(&1), "Should include alpha row 1");
+        assert!(found.contains(&2), "Should include alpha row 2");
+        assert!(found.contains(&5), "Should include gamma row 5");
+        assert!(found.contains(&6), "Should include gamma row 6");
+
+        // Test IN-list with single value (equivalent to equality)
+        let query_single = CompoundSargableQuery::FirstColumnIn(vec![ScalarValue::Utf8(Some(
+            "beta".to_string(),
+        ))]);
+
+        let result_single = index
+            .search(&query_single as &dyn AnyQuery, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        let found_single: Vec<u64> = result_single
+            .row_addrs()
+            .true_rows()
+            .row_addrs()
+            .map(|iter| iter.map(u64::from).collect())
+            .unwrap_or_default();
+
+        // beta has rows 3,4
+        assert_eq!(found_single.len(), 2, "Should find 2 rows for beta");
+        assert!(found_single.contains(&3), "Should include beta row 3");
+        assert!(found_single.contains(&4), "Should include beta row 4");
+
+        // Test IN-list with non-existent value
+        let query_nonexistent = CompoundSargableQuery::FirstColumnIn(vec![ScalarValue::Utf8(
+            Some("zeta".to_string()),
+        )]);
+
+        let result_nonexistent = index
+            .search(&query_nonexistent as &dyn AnyQuery, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        let found_nonexistent: Vec<u64> = result_nonexistent
+            .row_addrs()
+            .true_rows()
+            .row_addrs()
+            .map(|iter| iter.map(u64::from).collect())
+            .unwrap_or_default();
+
+        assert!(
+            found_nonexistent.is_empty(),
+            "Should find no rows for non-existent tenant"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compound_index_prefix_in() {
+        // Test IN-list query after a prefix of equality predicates
+        // e.g., WHERE tenant_id = 'acme' AND status IN ('active', 'pending')
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Create test data with 3 tenants, each with 4 statuses
+        let tenants = vec![
+            "acme", "acme", "acme", "acme", // 4 statuses for acme
+            "beta", "beta", "beta", "beta", // 4 statuses for beta
+            "gamma", "gamma", "gamma", "gamma", // 4 statuses for gamma
+        ];
+        let statuses = vec![
+            "active", "inactive", "pending", "archived",
+            "active", "inactive", "pending", "archived",
+            "active", "inactive", "pending", "archived",
+        ];
+        let row_ids: Vec<u64> = (1..=12).collect();
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("col0", DataType::Utf8, true),
+                Field::new("col1", DataType::Utf8, true),
+                Field::new(COMPOUND_IDS_COLUMN, DataType::UInt64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(tenants)) as ArrayRef,
+                Arc::new(StringArray::from(statuses)) as ArrayRef,
+                Arc::new(UInt64Array::from(row_ids)) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let column_names = vec!["tenant".to_string(), "status".to_string()];
+        let data_types = vec![DataType::Utf8, DataType::Utf8];
+        let compound_schema =
+            CompoundIndexSchema::new(column_names.clone(), data_types.clone()).unwrap();
+        let sub_index =
+            CompoundFlatIndexMetadata::new(column_names.clone(), data_types.clone()).unwrap();
+
+        let stream = batches_to_stream(vec![batch], sub_index.schema().clone());
+
+        train_compound_btree_index(
+            stream,
+            &sub_index,
+            store.as_ref(),
+            &compound_schema,
+            DEFAULT_COMPOUND_BATCH_SIZE,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let index = CompoundBTreeIndex::load(
+            store.clone(),
+            column_names.clone(),
+            None,
+            &LanceCache::no_cache(),
+        )
+        .await
+        .unwrap();
+
+        // Test PrefixIn query: tenant = 'acme' AND status IN ('active', 'pending')
+        let query = CompoundSargableQuery::prefix_in(
+            vec![ScalarValue::Utf8(Some("acme".to_string()))],
+            vec![
+                ScalarValue::Utf8(Some("active".to_string())),
+                ScalarValue::Utf8(Some("pending".to_string())),
+            ],
+        );
+
+        let result = index
+            .search(&query as &dyn AnyQuery, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        let found: Vec<u64> = result
+            .row_addrs()
+            .true_rows()
+            .row_addrs()
+            .map(|iter| iter.map(u64::from).collect())
+            .unwrap_or_default();
+
+        // acme has: active=1, inactive=2, pending=3, archived=4
+        // We should find rows 1 (active) and 3 (pending)
+        assert_eq!(found.len(), 2, "Should find 2 rows for acme with active/pending");
+        assert!(found.contains(&1), "Should include acme/active row 1");
+        assert!(found.contains(&3), "Should include acme/pending row 3");
+
+        // Test PrefixIn for different tenant
+        let query_beta = CompoundSargableQuery::prefix_in(
+            vec![ScalarValue::Utf8(Some("beta".to_string()))],
+            vec![
+                ScalarValue::Utf8(Some("inactive".to_string())),
+                ScalarValue::Utf8(Some("archived".to_string())),
+            ],
+        );
+
+        let result_beta = index
+            .search(&query_beta as &dyn AnyQuery, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        let found_beta: Vec<u64> = result_beta
+            .row_addrs()
+            .true_rows()
+            .row_addrs()
+            .map(|iter| iter.map(u64::from).collect())
+            .unwrap_or_default();
+
+        // beta has: active=5, inactive=6, pending=7, archived=8
+        // We should find rows 6 (inactive) and 8 (archived)
+        assert_eq!(found_beta.len(), 2, "Should find 2 rows for beta with inactive/archived");
+        assert!(found_beta.contains(&6), "Should include beta/inactive row 6");
+        assert!(found_beta.contains(&8), "Should include beta/archived row 8");
+
+        // Test PrefixIn with non-existent prefix
+        let query_nonexistent = CompoundSargableQuery::prefix_in(
+            vec![ScalarValue::Utf8(Some("zeta".to_string()))],
+            vec![ScalarValue::Utf8(Some("active".to_string()))],
+        );
+
+        let result_nonexistent = index
+            .search(&query_nonexistent as &dyn AnyQuery, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        let found_nonexistent: Vec<u64> = result_nonexistent
+            .row_addrs()
+            .true_rows()
+            .row_addrs()
+            .map(|iter| iter.map(u64::from).collect())
+            .unwrap_or_default();
+
+        assert!(
+            found_nonexistent.is_empty(),
+            "Should find no rows for non-existent tenant"
+        );
+
+        // Test PrefixIn with non-existent IN values
+        let query_no_match = CompoundSargableQuery::prefix_in(
+            vec![ScalarValue::Utf8(Some("acme".to_string()))],
+            vec![ScalarValue::Utf8(Some("deleted".to_string()))],
+        );
+
+        let result_no_match = index
+            .search(&query_no_match as &dyn AnyQuery, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        let found_no_match: Vec<u64> = result_no_match
+            .row_addrs()
+            .true_rows()
+            .row_addrs()
+            .map(|iter| iter.map(u64::from).collect())
+            .unwrap_or_default();
+
+        assert!(
+            found_no_match.is_empty(),
+            "Should find no rows for non-existent status"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compound_index_prefix_is_null() {
+        // Test IS NULL query after a prefix of equality predicates
+        // e.g., WHERE tenant_id = 'acme' AND deleted_at IS NULL
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Create test data with some NULL values in the second column
+        // Schema: (tenant, deleted_at) where deleted_at can be NULL
+        let tenants = vec![
+            "acme", "acme", "acme",    // 3 rows for acme
+            "beta", "beta", "beta",    // 3 rows for beta
+            "gamma", "gamma", "gamma", // 3 rows for gamma
+        ];
+        // Mix of NULL and non-NULL deleted_at values
+        let deleted_at: Vec<Option<&str>> = vec![
+            None, Some("2024-01-01"), Some("2024-01-02"),      // acme: 1 NULL, 2 deleted
+            Some("2024-01-03"), None, None,                     // beta: 2 NULL, 1 deleted
+            None, None, None,                                   // gamma: all NULL (no deletes)
+        ];
+        let row_ids: Vec<u64> = (1..=9).collect();
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("col0", DataType::Utf8, true),
+                Field::new("col1", DataType::Utf8, true),
+                Field::new(COMPOUND_IDS_COLUMN, DataType::UInt64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(tenants)) as ArrayRef,
+                Arc::new(StringArray::from(deleted_at)) as ArrayRef,
+                Arc::new(UInt64Array::from(row_ids)) as ArrayRef,
+            ],
+        )
+        .unwrap();
+
+        let column_names = vec!["tenant".to_string(), "deleted_at".to_string()];
+        let data_types = vec![DataType::Utf8, DataType::Utf8];
+        let compound_schema =
+            CompoundIndexSchema::new(column_names.clone(), data_types.clone()).unwrap();
+        let sub_index =
+            CompoundFlatIndexMetadata::new(column_names.clone(), data_types.clone()).unwrap();
+
+        let stream = batches_to_stream(vec![batch], sub_index.schema().clone());
+
+        train_compound_btree_index(
+            stream,
+            &sub_index,
+            store.as_ref(),
+            &compound_schema,
+            DEFAULT_COMPOUND_BATCH_SIZE,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let index = CompoundBTreeIndex::load(
+            store.clone(),
+            column_names.clone(),
+            None,
+            &LanceCache::no_cache(),
+        )
+        .await
+        .unwrap();
+
+        // Test PrefixIsNull: tenant = 'acme' AND deleted_at IS NULL
+        let query = CompoundSargableQuery::prefix_is_null(
+            vec![ScalarValue::Utf8(Some("acme".to_string()))],
+            0, // Check NULL on column index 0 after prefix (which is the deleted_at column)
+        );
+
+        let result = index
+            .search(&query as &dyn AnyQuery, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        let found: Vec<u64> = result
+            .row_addrs()
+            .true_rows()
+            .row_addrs()
+            .map(|iter| iter.map(u64::from).collect())
+            .unwrap_or_default();
+
+        // acme rows: 1 (NULL), 2 (2024-01-01), 3 (2024-01-02)
+        // Only row 1 has deleted_at = NULL
+        assert_eq!(found.len(), 1, "Should find 1 row for acme with deleted_at IS NULL");
+        assert!(found.contains(&1), "Should include acme row 1 with NULL deleted_at");
+
+        // Test PrefixIsNull for beta: should find 2 rows with NULL deleted_at
+        let query_beta = CompoundSargableQuery::prefix_is_null(
+            vec![ScalarValue::Utf8(Some("beta".to_string()))],
+            0,
+        );
+
+        let result_beta = index
+            .search(&query_beta as &dyn AnyQuery, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        let found_beta: Vec<u64> = result_beta
+            .row_addrs()
+            .true_rows()
+            .row_addrs()
+            .map(|iter| iter.map(u64::from).collect())
+            .unwrap_or_default();
+
+        // beta rows: 4 (2024-01-03), 5 (NULL), 6 (NULL)
+        // Rows 5 and 6 have deleted_at = NULL
+        assert_eq!(found_beta.len(), 2, "Should find 2 rows for beta with deleted_at IS NULL");
+        assert!(found_beta.contains(&5), "Should include beta row 5 with NULL deleted_at");
+        assert!(found_beta.contains(&6), "Should include beta row 6 with NULL deleted_at");
+
+        // Test PrefixIsNull for gamma: all rows have NULL deleted_at
+        let query_gamma = CompoundSargableQuery::prefix_is_null(
+            vec![ScalarValue::Utf8(Some("gamma".to_string()))],
+            0,
+        );
+
+        let result_gamma = index
+            .search(&query_gamma as &dyn AnyQuery, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        let found_gamma: Vec<u64> = result_gamma
+            .row_addrs()
+            .true_rows()
+            .row_addrs()
+            .map(|iter| iter.map(u64::from).collect())
+            .unwrap_or_default();
+
+        // gamma rows: 7 (NULL), 8 (NULL), 9 (NULL)
+        assert_eq!(found_gamma.len(), 3, "Should find all 3 rows for gamma with deleted_at IS NULL");
+        assert!(found_gamma.contains(&7), "Should include gamma row 7");
+        assert!(found_gamma.contains(&8), "Should include gamma row 8");
+        assert!(found_gamma.contains(&9), "Should include gamma row 9");
+
+        // Test PrefixIsNull for non-existent tenant
+        let query_nonexistent = CompoundSargableQuery::prefix_is_null(
+            vec![ScalarValue::Utf8(Some("zeta".to_string()))],
+            0,
+        );
+
+        let result_nonexistent = index
+            .search(&query_nonexistent as &dyn AnyQuery, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+
+        let found_nonexistent: Vec<u64> = result_nonexistent
+            .row_addrs()
+            .true_rows()
+            .row_addrs()
+            .map(|iter| iter.map(u64::from).collect())
+            .unwrap_or_default();
+
+        assert!(
+            found_nonexistent.is_empty(),
+            "Should find no rows for non-existent tenant"
+        );
+    }
+
+    #[test]
+    fn test_compound_btree_lookup_pruning_prefix_in() {
+        use super::super::compound::CompoundSargableQuery;
+
+        // Create page stats for testing PrefixIn pruning
+        let page_stats = vec![
+            CompoundPageStats {
+                mins: vec![ScalarValue::Utf8(Some("acme".to_string())), ScalarValue::Utf8(Some("active".to_string()))],
+                maxs: vec![ScalarValue::Utf8(Some("acme".to_string())), ScalarValue::Utf8(Some("pending".to_string()))],
+                null_counts: vec![0, 0],
+                page_number: 0,
+            },
+            CompoundPageStats {
+                mins: vec![ScalarValue::Utf8(Some("beta".to_string())), ScalarValue::Utf8(Some("active".to_string()))],
+                maxs: vec![ScalarValue::Utf8(Some("beta".to_string())), ScalarValue::Utf8(Some("inactive".to_string()))],
+                null_counts: vec![0, 0],
+                page_number: 1,
+            },
+            CompoundPageStats {
+                mins: vec![ScalarValue::Utf8(Some("gamma".to_string())), ScalarValue::Utf8(Some("archived".to_string()))],
+                maxs: vec![ScalarValue::Utf8(Some("gamma".to_string())), ScalarValue::Utf8(Some("pending".to_string()))],
+                null_counts: vec![0, 0],
+                page_number: 2,
+            },
+        ];
+
+        let lookup = CompoundBTreeLookup::new(page_stats, vec![DataType::Utf8, DataType::Utf8]);
+
+        // Query: tenant = 'acme' AND status IN ('active', 'pending')
+        // Should match page 0 only (acme tenant)
+        let query = CompoundSargableQuery::prefix_in(
+            vec![ScalarValue::Utf8(Some("acme".to_string()))],
+            vec![
+                ScalarValue::Utf8(Some("active".to_string())),
+                ScalarValue::Utf8(Some("pending".to_string())),
+            ],
+        );
+        let pages = lookup.find_candidate_pages(&query);
+        assert_eq!(pages, vec![0], "Should only match page 0 (acme)");
+
+        // Query: tenant = 'beta' AND status IN ('active', 'inactive')
+        // Should match page 1 only (beta tenant)
+        let query_beta = CompoundSargableQuery::prefix_in(
+            vec![ScalarValue::Utf8(Some("beta".to_string()))],
+            vec![
+                ScalarValue::Utf8(Some("active".to_string())),
+                ScalarValue::Utf8(Some("inactive".to_string())),
+            ],
+        );
+        let pages_beta = lookup.find_candidate_pages(&query_beta);
+        assert_eq!(pages_beta, vec![1], "Should only match page 1 (beta)");
+
+        // Query: tenant = 'acme' AND status IN ('deleted')
+        // Page 0 has status bounds [active, pending]. Lexicographically: "active" < "deleted" < "pending"
+        // So "deleted" falls WITHIN the bounds, and we cannot prune page 0.
+        let query_deleted = CompoundSargableQuery::prefix_in(
+            vec![ScalarValue::Utf8(Some("acme".to_string()))],
+            vec![ScalarValue::Utf8(Some("deleted".to_string()))],
+        );
+        let pages_deleted = lookup.find_candidate_pages(&query_deleted);
+        assert_eq!(pages_deleted, vec![0], "Should match page 0 since 'deleted' is within [active, pending] bounds");
+
+        // Query: tenant = 'acme' AND status IN ('zzz')
+        // "zzz" > "pending" (page 0's max), so we CAN prune
+        let query_zzz = CompoundSargableQuery::prefix_in(
+            vec![ScalarValue::Utf8(Some("acme".to_string()))],
+            vec![ScalarValue::Utf8(Some("zzz".to_string()))],
+        );
+        let pages_zzz = lookup.find_candidate_pages(&query_zzz);
+        assert!(pages_zzz.is_empty(), "Should prune page 0 when status IN ('zzz') is outside bounds");
+
+        // Query: tenant = 'zeta' AND status IN ('active')
+        // Should match no pages (no zeta tenant)
+        let query_zeta = CompoundSargableQuery::prefix_in(
+            vec![ScalarValue::Utf8(Some("zeta".to_string()))],
+            vec![ScalarValue::Utf8(Some("active".to_string()))],
+        );
+        let pages_zeta = lookup.find_candidate_pages(&query_zeta);
+        assert!(pages_zeta.is_empty(), "Should match no pages for non-existent tenant");
+    }
+
+    #[test]
+    fn test_compound_btree_lookup_pruning_prefix_is_null() {
+        use super::super::compound::CompoundSargableQuery;
+
+        // Create page stats with varying null counts
+        let page_stats = vec![
+            CompoundPageStats {
+                mins: vec![ScalarValue::Utf8(Some("acme".to_string())), ScalarValue::Utf8(Some("2024-01-01".to_string()))],
+                maxs: vec![ScalarValue::Utf8(Some("acme".to_string())), ScalarValue::Utf8(Some("2024-01-31".to_string()))],
+                null_counts: vec![0, 5], // 5 nulls in deleted_at column
+                page_number: 0,
+            },
+            CompoundPageStats {
+                mins: vec![ScalarValue::Utf8(Some("beta".to_string())), ScalarValue::Utf8(Some("2024-02-01".to_string()))],
+                maxs: vec![ScalarValue::Utf8(Some("beta".to_string())), ScalarValue::Utf8(Some("2024-02-28".to_string()))],
+                null_counts: vec![0, 0], // No nulls in deleted_at
+                page_number: 1,
+            },
+            CompoundPageStats {
+                mins: vec![ScalarValue::Utf8(Some("gamma".to_string())), ScalarValue::Utf8(None)], // All nulls
+                maxs: vec![ScalarValue::Utf8(Some("gamma".to_string())), ScalarValue::Utf8(None)],
+                null_counts: vec![0, 10], // All rows have null deleted_at
+                page_number: 2,
+            },
+        ];
+
+        let lookup = CompoundBTreeLookup::new(page_stats, vec![DataType::Utf8, DataType::Utf8]);
+
+        // Query: tenant = 'acme' AND deleted_at IS NULL
+        // Should match page 0 (acme has some nulls)
+        let query_acme = CompoundSargableQuery::prefix_is_null(
+            vec![ScalarValue::Utf8(Some("acme".to_string()))],
+            0,
+        );
+        let pages_acme = lookup.find_candidate_pages(&query_acme);
+        assert_eq!(pages_acme, vec![0], "Should match page 0 (acme has nulls)");
+
+        // Query: tenant = 'beta' AND deleted_at IS NULL
+        // Should NOT match page 1 (beta has no nulls in deleted_at)
+        let query_beta = CompoundSargableQuery::prefix_is_null(
+            vec![ScalarValue::Utf8(Some("beta".to_string()))],
+            0,
+        );
+        let pages_beta = lookup.find_candidate_pages(&query_beta);
+        assert!(pages_beta.is_empty(), "Should prune page 1 (beta has no nulls)");
+
+        // Query: tenant = 'gamma' AND deleted_at IS NULL
+        // Should match page 2 (gamma has all nulls)
+        let query_gamma = CompoundSargableQuery::prefix_is_null(
+            vec![ScalarValue::Utf8(Some("gamma".to_string()))],
+            0,
+        );
+        let pages_gamma = lookup.find_candidate_pages(&query_gamma);
+        assert_eq!(pages_gamma, vec![2], "Should match page 2 (gamma has nulls)");
+
+        // Query: tenant = 'zeta' AND deleted_at IS NULL
+        // Should match no pages (no zeta tenant)
+        let query_zeta = CompoundSargableQuery::prefix_is_null(
+            vec![ScalarValue::Utf8(Some("zeta".to_string()))],
+            0,
+        );
+        let pages_zeta = lookup.find_candidate_pages(&query_zeta);
+        assert!(pages_zeta.is_empty(), "Should match no pages for non-existent tenant");
     }
 }
