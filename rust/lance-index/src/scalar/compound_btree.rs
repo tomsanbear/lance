@@ -1499,7 +1499,7 @@ impl CompoundBTreeIndex {
             for (idx, is_match) in eq_result.iter().enumerate() {
                 if is_match == Some(true) {
                     let row_id = row_id_col.value(idx);
-                    result.insert(row_id.into());
+                    result.insert(row_id);
                 }
             }
         }
@@ -1562,8 +1562,7 @@ impl CompoundBTreeIndex {
                     })?;
 
                     // Check if the value matches any in the IN-list
-                    let matches_in_list = in_values.iter().any(|v| *v == actual_value);
-                    if matches_in_list {
+                    if in_values.contains(&actual_value) {
                         result.insert(row_id_col.value(row_idx));
                     }
                 } else {
