@@ -1155,22 +1155,17 @@ impl DatasetIndexExt for Dataset {
         column: &str,
         index_name: &str,
     ) -> Result<Option<Arc<dyn Index>>> {
-        use lance_index::{metrics::NoOpMetricsCollector, ScalarIndexCriteria};
+        use lance_index::{metrics::NoOpMetricsCollector, IndexCriteria};
 
         // Find index metadata by name
-        let idx_metadata = self
-            .load_scalar_index(ScalarIndexCriteria::default().with_name(index_name))
-            .await?;
+        let idx_metadata =
+            self.load_scalar_index(IndexCriteria::default().with_name(index_name)).await?;
 
         match idx_metadata {
             Some(metadata) => {
                 // Open the actual index instance using internal method
                 let index = self
-                    .open_scalar_index(
-                        column,
-                        &metadata.uuid.to_string(),
-                        &NoOpMetricsCollector,
-                    )
+                    .open_scalar_index(column, &metadata.uuid.to_string(), &NoOpMetricsCollector)
                     .await?;
 
                 // Return as generic Index trait object

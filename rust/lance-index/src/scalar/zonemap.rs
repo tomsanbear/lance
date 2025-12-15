@@ -208,9 +208,9 @@ impl ZoneMapIndex {
                     })?;
 
                 Ok(serde_json::json!({
-                    "fragment_id": zone.fragment_id,
-                    "zone_start": zone.zone_start,
-                    "zone_length": zone.zone_length,
+                    "fragment_id": zone.bound.fragment_id,
+                    "zone_start": zone.bound.start,
+                    "zone_length": zone.bound.length,
                     "min": min_value,
                     "max": max_value,
                     "null_count": zone.null_count,
@@ -634,7 +634,7 @@ impl Index for ZoneMapIndex {
         // proper roundtrip serialization without loss of type information
         let min_proto: Option<protobuf::ScalarValue> = global_min
             .as_ref()
-            .map(|v| protobuf::ScalarValue::try_from(v))
+            .map(protobuf::ScalarValue::try_from)
             .transpose()
             .map_err(|e| Error::Index {
                 message: format!("Failed to convert min value to protobuf: {}", e),
@@ -643,7 +643,7 @@ impl Index for ZoneMapIndex {
 
         let max_proto: Option<protobuf::ScalarValue> = global_max
             .as_ref()
-            .map(|v| protobuf::ScalarValue::try_from(v))
+            .map(protobuf::ScalarValue::try_from)
             .transpose()
             .map_err(|e| Error::Index {
                 message: format!("Failed to convert max value to protobuf: {}", e),
