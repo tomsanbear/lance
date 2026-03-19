@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use lance_core::{Error, Result};
 
-use crate::{IndexParams, IndexType, optimize::OptimizeOptions, types::IndexSegment};
+use crate::{Index, IndexParams, IndexType, optimize::OptimizeOptions, types::IndexSegment};
 use lance_table::format::IndexMetadata;
 
 /// A set of criteria used to filter potential indices to use for a query
@@ -288,4 +288,40 @@ pub trait DatasetIndexExt {
         partition_id: usize,
         with_vector: bool,
     ) -> Result<SendableRecordBatchStream>;
+
+    /// Open a scalar index by name and return its Index trait object.
+    ///
+    /// This allows reading index metadata and statistics without performing a query.
+    /// Useful for query optimizers that need column statistics from zonemap indices.
+    ///
+    /// # Arguments
+    /// * `column` - The column name the index is built on
+    /// * `index_name` - The name of the index (e.g., "idx_my_column_zonemap")
+    ///
+    /// # Returns
+    /// * `Ok(Some(index))` - Index found and opened successfully
+    /// * `Ok(None)` - No index with that name exists for the column
+    /// * `Err(_)` - Error opening the index
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use lance::{Dataset, Result};
+    /// # use lance_index::DatasetIndexExt;
+    /// # async fn example(dataset: &Dataset) -> Result<()> {
+    /// let index = dataset
+    ///     .open_scalar_index_by_name("price", "idx_price_zonemap")
+    ///     .await?;
+    ///
+    /// if let Some(idx) = index {
+    ///     let stats = idx.statistics()?;
+    ///     println!("Stats: {}", stats);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn open_scalar_index_by_name(
+        &self,
+        column: &str,
+        index_name: &str,
+    ) -> Result<Option<Arc<dyn Index>>>;
 }

@@ -2738,6 +2738,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "datafusion-proto-common"
+version = "52.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b16bf2f2a9f99c48b61537870736f0aa9500c4128407c9999261ff3e8a170523"
+dependencies = [
+ "arrow",
+ "datafusion-common",
+ "pbjson",
+ "prost",
+ "serde",
+]
+
+[[package]]
 name = "datafusion-pruning"
 version = "52.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5110,6 +5123,7 @@ dependencies = [
  "arrow-arith",
  "arrow-array",
  "arrow-ord",
+ "arrow-row",
  "arrow-schema",
  "arrow-select",
  "async-channel 2.5.0",
@@ -5125,6 +5139,7 @@ dependencies = [
  "datafusion-common",
  "datafusion-expr",
  "datafusion-physical-expr",
+ "datafusion-proto-common",
  "datafusion-sql",
  "deepsize",
  "dirs 6.0.0",
@@ -5158,6 +5173,7 @@ dependencies = [
  "num-traits",
  "object_store",
  "pprof",
+ "proptest",
  "prost",
  "prost-build",
  "prost-types",
@@ -10272,18 +10288,18 @@ dependencies = [
 
 [[package]]
 name = "zerocopy"
-version = "0.8.42"
+version = "0.8.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2578b716f8a7a858b7f02d5bd870c14bf4ddbbcf3a4c05414ba6503640505e3"
+checksum = "5c5030500cb2d66bdfbb4ebc9563be6ce7005a4b5d0f26be0c523870fe372ca6"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.42"
+version = "0.8.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e6cc098ea4d3bd6246687de65af3f920c430e236bee1e3bf2e441463f08a02f"
+checksum = "a5f86989a046a79640b9d8867c823349a139367bda96549794fcc3313ce91f4e"
 dependencies = [
  "proc-macro2",
  "quote",
