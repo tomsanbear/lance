@@ -2637,9 +2637,13 @@ where
             let _ = progress_tx.send(total);
         })
     };
-    let kmeans_params = KMeansParams::new(centroids, params.max_iters as u32, REDOS, metric_type)
-        .with_balance_factor(1.0)
-        .with_on_progress(on_progress);
+    let mut kmeans_params =
+        KMeansParams::new(centroids, params.max_iters as u32, REDOS, metric_type)
+            .with_balance_factor(1.0)
+            .with_on_progress(on_progress);
+    if let Some(seed) = params.seed {
+        kmeans_params = kmeans_params.with_seed(seed);
+    }
     let kmeans = lance_index::vector::kmeans::train_kmeans::<T>(
         data,
         kmeans_params,

@@ -83,6 +83,13 @@ pub struct IvfBuildParams {
 
     /// Storage options used to load precomputed partitions.
     pub storage_options: Option<HashMap<String, String>>,
+
+    /// Optional seed for the KMeans RNG that drives centroid
+    /// initialization and empty-cluster splitting. When set, building
+    /// the IVF over the same data is reproducible — needed by
+    /// integration tests of vector-search that assert on top-K
+    /// recall. When `None`, each run reseeds from OS entropy.
+    pub seed: Option<u64>,
 }
 
 impl Default for IvfBuildParams {
@@ -102,6 +109,7 @@ impl Default for IvfBuildParams {
             shuffle_partition_batches: 1024 * 10,
             shuffle_partition_concurrency: 2,
             storage_options: None,
+            seed: None,
         }
     }
 }

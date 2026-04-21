@@ -88,6 +88,14 @@ pub struct KMeansParams {
 
     /// Optional sync callback for iteration progress: (current_iteration, max_iterations).
     pub on_progress: Option<Arc<dyn Fn(u32, u32) + Send + Sync>>,
+
+    /// Optional seed for the random-number generators used during
+    /// training (centroid initialization, empty-cluster splitting).
+    /// When `Some`, every training run with the same inputs produces
+    /// identical centroids, which is required for reproducible
+    /// integration tests of IVF-based vector indexes. When `None`,
+    /// each run reseeds from OS entropy — the historical default.
+    pub seed: Option<u64>,
 }
 
 impl std::fmt::Debug for KMeansParams {
@@ -101,6 +109,7 @@ impl std::fmt::Debug for KMeansParams {
             .field("balance_factor", &self.balance_factor)
             .field("hierarchical_k", &self.hierarchical_k)
             .field("on_progress", &self.on_progress.as_ref().map(|_| "..."))
+            .field("seed", &self.seed)
             .finish()
     }
 }
@@ -116,6 +125,7 @@ impl Default for KMeansParams {
             balance_factor: 0.0,
             hierarchical_k: 16,
             on_progress: None,
+            seed: None,
         }
     }
 }
@@ -163,6 +173,15 @@ impl KMeansParams {
         self.hierarchical_k = hierarchical_k;
         self
     }
+
+    /// Pin the RNG seed used for centroid initialization and
+    /// empty-cluster splitting. When set, training is deterministic
+    /// given the same input vectors and params — required by
+    /// reproducible integration tests of IVF-based vector indexes.
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self
+    }
 }
 
 /// Randomly initialize kmeans centroids.
@@ -198,9 +217,9 @@ fn split_clusters<T: Float + MulAssign>(
     cnts: &mut [usize],
     centroids: &mut [T],
     dim: usize,
+    rng: &mut dyn rand::RngCore,
 ) {
     let eps = T::from(1.0 / 1024.0).unwrap();
-    let mut rng = SmallRng::from_os_rng();
     for i in 0..cnts.len() {
         if cnts[i] == 0 {
             let mut j = 0;
@@ -313,6 +332,11 @@ pub trait KMeansAlgo<T: Num> {
     ) -> (Vec<Option<u32>>, Vec<Option<f32>>);
 
     /// Construct a new KMeans model.
+    ///
+    /// `rng` is threaded through so implementations that need a RNG
+    /// (e.g. the Float impl which calls `split_clusters` for empty
+    /// clusters) stay deterministic when `KMeansParams.seed` is set.
+    /// Impls that don't need randomness (e.g. Hamming) can ignore it.
     fn to_kmeans(
         data: &[T],
         dimension: usize,
@@ -321,6 +345,7 @@ pub trait KMeansAlgo<T: Num> {
         cluster_sizes: &mut [usize],
         distance_type: DistanceType,
         loss: f64,
+        rng: &mut dyn rand::RngCore,
     ) -> KMeans;
 }
 
@@ -398,6 +423,7 @@ where
         cluster_sizes: &mut [usize],
         distance_type: DistanceType,
         loss: f64,
+        rng: &mut dyn rand::RngCore,
     ) -> KMeans {
         let mut centroids = vec![T::Native::zero(); k * dimension];
 
@@ -464,6 +490,7 @@ where
             cluster_sizes,
             &mut centroids,
             dimension,
+            rng,
         );
 
         KMeans {
@@ -514,6 +541,7 @@ impl KMeansAlgo<u8> for KModeAlgo {
         _cluster_sizes: &mut [usize],
         distance_type: DistanceType,
         loss: f64,
+        _rng: &mut dyn rand::RngCore,
     ) -> KMeans {
         assert_eq!(distance_type, DistanceType::Hamming);
 
@@ -799,8 +827,14 @@ impl KMeans {
         let mut cluster_sizes = vec![0; k];
         let mut adjusted_balance_factor = f32::MAX;
 
-        // TODO: use seed for Rng.
-        let rng = SmallRng::from_os_rng();
+        // Honor the caller's seed when set so tests can pin KMeans
+        // output; otherwise reseed from OS entropy on every call
+        // (preserving the historical non-deterministic default for
+        // production callers that don't care).
+        let mut rng = match params.seed {
+            Some(seed) => SmallRng::seed_from_u64(seed),
+            None => SmallRng::from_os_rng(),
+        };
         for redo in 1..=params.redos {
             let mut kmeans: Self = match &params.init {
                 KMeanInit::Random => Self::init_random::<T>(
@@ -860,6 +894,7 @@ impl KMeans {
                     &mut cluster_sizes,
                     params.distance_type,
                     last_loss,
+                    &mut rng,
                 );
                 if (loss - last_loss).abs() < params.tolerance * last_loss {
                     info!(
@@ -1676,6 +1711,48 @@ mod tests {
         assert_eq!(kmeans.centroids.len(), K * DIM);
         assert_eq!(kmeans.dimension, DIM);
         assert_eq!(kmeans.centroids.data_type(), &DataType::UInt8);
+    }
+
+    #[tokio::test]
+    async fn test_seed_pins_kmeans_output() {
+        // Two trainings with the same seed must produce identical
+        // centroids; without the seed, two trainings (in this same
+        // process, on the same data) almost always diverge because
+        // KMeans++ init samples from `SmallRng::from_os_rng()`. This
+        // is the property our IVF integration tests downstream rely
+        // on for reproducible top-K recall assertions.
+        const DIM: usize = 16;
+        const K: usize = 8;
+        const NUM_VALUES: usize = 256 * K;
+
+        let values = generate_random_array(NUM_VALUES * DIM);
+        let fsl = FixedSizeListArray::try_new_from_values(values, DIM as i32).unwrap();
+
+        let seeded = KMeansParams {
+            max_iters: 20,
+            seed: Some(42),
+            ..Default::default()
+        };
+        let a = KMeans::new_with_params(&fsl, K, &seeded).unwrap();
+        let b = KMeans::new_with_params(&fsl, K, &seeded).unwrap();
+
+        let a_vals = a.centroids.as_primitive::<Float32Type>().values();
+        let b_vals = b.centroids.as_primitive::<Float32Type>().values();
+        assert_eq!(a_vals, b_vals, "seeded KMeans must produce identical centroids");
+
+        // Different seed should diverge (sanity: confirms the seed
+        // actually drives the RNG, not just a no-op).
+        let other = KMeansParams {
+            max_iters: 20,
+            seed: Some(43),
+            ..Default::default()
+        };
+        let c = KMeans::new_with_params(&fsl, K, &other).unwrap();
+        let c_vals = c.centroids.as_primitive::<Float32Type>().values();
+        assert_ne!(
+            a_vals, c_vals,
+            "different seeds should typically yield different centroids on random data",
+        );
     }
 
     #[tokio::test]
