@@ -3876,7 +3876,7 @@ mod tests {
         ));
 
         // Perform the update
-        index.update(new_stream, update_store.as_ref()).await.unwrap();
+        index.update(new_stream, update_store.as_ref(), None).await.unwrap();
 
         // Load the updated index
         let updated_index = CompoundBTreeIndex::load(
@@ -4096,7 +4096,7 @@ mod tests {
         ));
 
         // Perform update
-        index.update(new_stream, update_store.as_ref()).await.unwrap();
+        index.update(new_stream, update_store.as_ref(), None).await.unwrap();
 
         // Load updated index
         let updated_index = CompoundBTreeIndex::load(
@@ -4242,7 +4242,7 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        index.update(new_stream, update_store.as_ref()).await.unwrap();
+        index.update(new_stream, update_store.as_ref(), None).await.unwrap();
 
         let updated_index = CompoundBTreeIndex::load(
             update_store.clone(),
@@ -4466,7 +4466,7 @@ mod tests {
             Arc::new(LanceCache::no_cache()),
         ));
 
-        index.update(new_stream, update_store.as_ref()).await.unwrap();
+        index.update(new_stream, update_store.as_ref(), None).await.unwrap();
 
         let updated_index = CompoundBTreeIndex::load(
             update_store.clone(),
