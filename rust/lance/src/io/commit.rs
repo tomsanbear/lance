@@ -230,8 +230,12 @@ async fn do_commit_new_dataset(
     )
     .await;
 
-    // TODO: Allow Append or Overwrite mode to retry using `commit_transaction`
-    // if there is a conflict.
+    // Concurrent-creator races (Overwrite transaction losing the
+    // initial conditional-put) are resolved one layer up in
+    // `CommitBuilder::execute`: the loser loads the now-existing
+    // dataset and retries via `commit_transaction`. Clone races are
+    // still surfaced as `DatasetAlreadyExists` here — Clone
+    // semantics against an existing dataset aren't defined.
     match result {
         Ok(manifest_location) => {
             let tx_key = crate::session::caches::TransactionKey {
