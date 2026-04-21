@@ -397,7 +397,25 @@ impl<'a> CommitBuilder<'a> {
                 "detached commits cannot currently be used to create new datasets".into(),
             ));
         } else {
-            commit_new_dataset(
+            // Create-new path. On `DatasetAlreadyExists` (another
+            // writer won the conditional-put race and the dataset
+            // now exists at `base_path`) fall through to
+            // `commit_transaction`, which has the retry-with-backoff
+            // loop for manifest conflicts on existing datasets.
+            // Resolves the TODO in `do_commit_new_dataset` and the
+            // long-standing issue lancedb/lance#2403 ("Concurrent
+            // create dataset gives bad error, doesn't retry").
+            //
+            // The fallback only runs for `Operation::Overwrite` —
+            // `commit_transaction` doesn't handle `Operation::Clone`
+            // against an existing dataset, so Clone races keep their
+            // hard-error behaviour. Everything sourced from
+            // `self`/`manifest_config` that was computed pre-load
+            // (manifest_naming_scheme, use_stable_row_ids, storage
+            // format) is re-derived from the loaded dataset — the
+            // winner's choices are authoritative once they committed
+            // manifest v1.
+            match commit_new_dataset(
                 object_store.as_ref(),
                 commit_handler.as_ref(),
                 &base_path,
@@ -407,7 +425,65 @@ impl<'a> CommitBuilder<'a> {
                 metadata_cache.as_ref(),
                 session.store_registry(),
             )
-            .await?
+            .await
+            {
+                Ok(result) => result,
+                Err(Error::DatasetAlreadyExists { .. })
+                    if matches!(transaction.operation, Operation::Overwrite { .. }) =>
+                {
+                    let loaded = DatasetBuilder::from_uri(dest.uri())
+                        .with_read_params(ReadParams {
+                            store_options: self.store_params.clone(),
+                            commit_handler: self.commit_handler.clone(),
+                            ..Default::default()
+                        })
+                        .with_session(session.clone())
+                        .load()
+                        .await?;
+
+                    // Mirror the storage-format compat check that runs
+                    // at line ~293 when dest.dataset() was populated
+                    // from the start. The loaded dataset's format is
+                    // authoritative; reject incoming data whose format
+                    // can't coexist with it (Overwrite is permitted to
+                    // change format, hence the explicit exclusion).
+                    if let Some(storage_format) = self.storage_format {
+                        let passed_storage_format = DataStorageFormat::new(storage_format);
+                        if loaded.manifest.data_storage_format != passed_storage_format
+                            && !matches!(transaction.operation, Operation::Overwrite { .. })
+                        {
+                            return Err(Error::invalid_input_source(
+                                format!(
+                                    "Storage format mismatch. Existing dataset uses {:?}, but new data uses {:?}",
+                                    loaded.manifest.data_storage_format,
+                                    passed_storage_format,
+                                )
+                                .into(),
+                            ));
+                        }
+                    }
+
+                    let loaded_scheme = loaded.manifest_location.naming_scheme;
+                    let loaded_manifest_config = ManifestWriteConfig {
+                        use_stable_row_ids: loaded.manifest.uses_stable_row_ids(),
+                        storage_format: self.storage_format.map(DataStorageFormat::new),
+                        ..Default::default()
+                    };
+
+                    commit_transaction(
+                        &loaded,
+                        object_store.as_ref(),
+                        commit_handler.as_ref(),
+                        &transaction,
+                        &loaded_manifest_config,
+                        &self.commit_config,
+                        loaded_scheme,
+                        self.affected_rows.as_ref(),
+                    )
+                    .await?
+                }
+                Err(e) => return Err(e),
+            }
         };
 
         info!(
@@ -1071,6 +1147,187 @@ mod tests {
             io_stats.read_iops < 10,
             "read_iops = {}; a full listing was likely used",
             io_stats.read_iops
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_initial_create_falls_through_to_commit_transaction() {
+        // Two concurrent `InsertBuilder::execute` calls against the
+        // same fresh URI used to produce a hard
+        // `DatasetAlreadyExists` error for the loser of the
+        // conditional-put race. With the fall-through-to-
+        // `commit_transaction` fix in `CommitBuilder::execute`, the
+        // loser now re-loads the dataset created by the winner and
+        // retries as a commit against the existing dataset.
+        //
+        // Scope of this guarantee: both writers return `Ok` (no hard
+        // error). The loser's transaction still carries
+        // `Operation::Overwrite` (the operation produced by
+        // `WriteMode::Create`/`WriteMode::Overwrite` internally), so
+        // when it commits at the next manifest version it replaces
+        // the winner's data — last-writer-wins, consistent with
+        // `Operation::Overwrite` semantics elsewhere. Callers that
+        // need APPEND semantics on race-loss must issue an
+        // `Operation::Append` transaction themselves after reloading.
+        let session = Arc::new(Session::default());
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch_a = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..5_i32))],
+        )
+        .unwrap();
+        let batch_b = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(5..10_i32))],
+        )
+        .unwrap();
+
+        // Both writers share the same session so they hit the same
+        // in-memory object store.
+        let params_a = WriteParams {
+            session: Some(session.clone()),
+            enable_v2_manifest_paths: true,
+            ..Default::default()
+        };
+        let params_b = WriteParams {
+            session: Some(session.clone()),
+            enable_v2_manifest_paths: true,
+            ..Default::default()
+        };
+
+        let fut_a = async move {
+            InsertBuilder::new("memory://concurrent-create")
+                .with_params(&params_a)
+                .execute(vec![batch_a])
+                .await
+        };
+        let fut_b = async move {
+            InsertBuilder::new("memory://concurrent-create")
+                .with_params(&params_b)
+                .execute(vec![batch_b])
+                .await
+        };
+
+        let (res_a, res_b) = tokio::join!(fut_a, fut_b);
+        let ds_a = res_a.expect("concurrent writer A must not error");
+        let ds_b = res_b.expect("concurrent writer B must not error");
+
+        // The winner lands at manifest version 1 (fresh dataset).
+        // The loser's fall-through commit lands at version 2. Order
+        // is non-deterministic; assert the set of versions.
+        let mut versions = [ds_a.manifest().version, ds_b.manifest().version];
+        versions.sort_unstable();
+        assert_eq!(
+            versions,
+            [1, 2],
+            "concurrent writers must land at consecutive manifest versions; got {versions:?}",
+        );
+
+        // Reopen the dataset fresh and confirm it's readable with
+        // valid contents. Exactly one of the two batches survives
+        // (the one committed at version 2) per Overwrite semantics.
+        let final_ds = DatasetBuilder::from_uri("memory://concurrent-create")
+            .with_session(session.clone())
+            .load()
+            .await
+            .expect("final load must succeed");
+        assert_eq!(
+            final_ds.manifest().version,
+            2,
+            "latest dataset must be at version 2",
+        );
+        let row_count = final_ds.count_rows(None).await.expect("count_rows");
+        assert_eq!(
+            row_count, 5,
+            "exactly one 5-row batch survives under Overwrite semantics; got {row_count}",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_create_with_mismatched_v2_manifest_paths() {
+        // Two writers race to create the same dataset, each with
+        // different `enable_v2_manifest_paths` preferences. Without
+        // sourcing `manifest_naming_scheme` from the loaded dataset
+        // in the fallback path, the loser would write a manifest in
+        // its own preferred scheme against the winner's dataset —
+        // orphaning it on the winner's scheme and leaving the
+        // dataset in a degraded state where reloading can't see the
+        // loser's commit.
+        //
+        // With the fix, the loser adopts `loaded.manifest_location
+        // .naming_scheme` and commits through that scheme. Both
+        // manifests land consistently; the final reload observes
+        // the loser's v2 manifest.
+        let session = Arc::new(Session::default());
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "i",
+            DataType::Int32,
+            false,
+        )]));
+        let batch_a = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..5_i32))],
+        )
+        .unwrap();
+        let batch_b = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(5..10_i32))],
+        )
+        .unwrap();
+
+        let params_v2 = WriteParams {
+            session: Some(session.clone()),
+            enable_v2_manifest_paths: true,
+            ..Default::default()
+        };
+        let params_v1 = WriteParams {
+            session: Some(session.clone()),
+            enable_v2_manifest_paths: false,
+            ..Default::default()
+        };
+
+        let fut_a = async move {
+            InsertBuilder::new("memory://mismatched-v2-paths")
+                .with_params(&params_v2)
+                .execute(vec![batch_a])
+                .await
+        };
+        let fut_b = async move {
+            InsertBuilder::new("memory://mismatched-v2-paths")
+                .with_params(&params_v1)
+                .execute(vec![batch_b])
+                .await
+        };
+
+        let (res_a, res_b) = tokio::join!(fut_a, fut_b);
+        let ds_a = res_a.expect("writer A (v2) must not error");
+        let ds_b = res_b.expect("writer B (v1) must not error");
+
+        // The two returned datasets should land at consecutive
+        // manifest versions with a single shared naming scheme (the
+        // one the winner chose and the loser adopted via the
+        // fallback's `loaded.manifest_location.naming_scheme`
+        // sourcing). Without the tightened fix, the loser would
+        // write to a different scheme than the winner — the returned
+        // datasets would disagree on naming_scheme and subsequent
+        // reads using either scheme would be missing one manifest.
+        let mut versions = [ds_a.manifest().version, ds_b.manifest().version];
+        versions.sort_unstable();
+        assert_eq!(
+            versions,
+            [1, 2],
+            "both writers must land at consecutive versions; got {versions:?}",
+        );
+        assert_eq!(
+            ds_a.manifest_location.naming_scheme,
+            ds_b.manifest_location.naming_scheme,
+            "after the fallback fix, both writers must observe the same naming_scheme on their returned datasets; A={:?}, B={:?}",
+            ds_a.manifest_location.naming_scheme,
+            ds_b.manifest_location.naming_scheme,
         );
     }
 }
