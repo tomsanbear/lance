@@ -86,14 +86,22 @@ fn validate_index_columns(
 }
 
 /// Generate a default index name with collision handling.
+///
+/// Uses the user-supplied column names (from `columns`) to build the
+/// base name so the generated index name preserves whatever
+/// characters the caller passed. Going through
+/// `corrected_columns` instead would feed backtick-quoted names
+/// (from `format_field_path`) into the index name, producing
+/// surprising results like `` `user-id`_idx `` for a hyphenated
+/// column. The compound-column path already uses `columns.join("_")`
+/// for the same reason; this aligns the single-column path.
 fn generate_index_name(
     columns: &[String],
-    column: &str,
     field_ids: &[i32],
     indices: &[IndexMetadata],
 ) -> String {
     let column_path = if columns.len() == 1 {
-        default_index_name(&[column])
+        default_index_name(&[columns[0].as_str()])
     } else {
         columns.join("_")
     };
@@ -206,7 +214,7 @@ impl<'a> CreateIndexBuilder<'a> {
         let index_name = if let Some(name) = self.name.take() {
             name
         } else {
-            generate_index_name(&self.columns, column, &field_ids, &indices)
+            generate_index_name(&self.columns, &field_ids, &indices)
         };
         let existing_named_indices = indices
             .iter()
