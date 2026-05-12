@@ -341,6 +341,7 @@ pub(crate) async fn build_distributed_vector_index(
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
     fragment_ids: &[u32],
     progress: Arc<dyn IndexBuildProgress>,
+    _mem_pool_size: Option<u64>,
 ) -> Result<()> {
     let stages = &params.stages;
 
@@ -707,6 +708,7 @@ pub(crate) async fn build_vector_index(
     params: &VectorIndexParams,
     frag_reuse_index: Option<Arc<FragReuseIndex>>,
     progress: Arc<dyn IndexBuildProgress>,
+    _mem_pool_size: Option<u64>,
 ) -> Result<()> {
     let stages = &params.stages;
 
@@ -1228,6 +1230,7 @@ pub(crate) async fn build_empty_vector_index(
     name: &str,
     _uuid: &str,
     _params: &VectorIndexParams,
+    _mem_pool_size: Option<u64>,
 ) -> Result<()> {
     // For now, return a NotImplementedError to indicate this functionality
     // is still being developed
@@ -2193,6 +2196,7 @@ mod tests {
             None,
             &[invalid_id],
             noop_progress(),
+            None,
         )
         .await;
 
@@ -2245,6 +2249,7 @@ mod tests {
             None,
             &[],
             noop_progress(),
+            None,
         )
         .await;
 
@@ -2317,6 +2322,7 @@ mod tests {
             &params,
             None,
             progress.clone(),
+            None,
         )
         .await
         .unwrap();
@@ -2382,6 +2388,7 @@ mod tests {
             None,
             &[valid_id],
             noop_progress(),
+            None,
         )
         .await;
 

@@ -190,6 +190,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                 fragments,
                 true,
                 None,
+                None,
             )
             .await?;
 
@@ -208,6 +209,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     None,
                     Some(new_data_stream),
                     Arc::new(NoopIndexBuildProgress),
+                    None,
                 )
                 .await?
             } else {
