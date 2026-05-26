@@ -89,6 +89,7 @@ use std::sync::Arc;
 use super::fragment::FileFragment;
 use super::index::DatasetIndexRemapperOptions;
 use super::rowids::load_row_id_sequences;
+use super::scanner::ColumnOrdering;
 use super::transaction::{
     Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
 };
@@ -220,6 +221,17 @@ pub struct CompactionOptions {
     /// of the global `DEFAULT_IO_BUFFER_SIZE_VALUE` (2 GiB). `None` (the
     /// default) preserves Lance's scheduler default.
     pub io_buffer_size_bytes: Option<u64>,
+    /// Columns to sort rows by within each rewrite group. When set, compaction
+    /// decodes and re-sorts rows before writing the new fragments, producing
+    /// zone-clustered output so zone-map indices can skip pages. `None` (the
+    /// default) preserves arrival order — the historical behavior.
+    ///
+    /// Sorting reorders rows, so it is incompatible with the binary-copy fast
+    /// path (disabled when this is set) and requires stable row ids: the
+    /// post-sort `_rowid` order is captured and carried onto the new fragments
+    /// so every row keeps its id. It also assumes uniform per-row version
+    /// sequences (the only shape Lance currently writes for appends).
+    pub sort_by: Option<Vec<String>>,
 }
 
 #[allow(deprecated)]
@@ -242,6 +254,7 @@ impl Default for CompactionOptions {
             max_source_fragments: None,
             transaction_properties: None,
             io_buffer_size_bytes: None,
+            sort_by: None,
         }
     }
 }
@@ -898,6 +911,7 @@ async fn prepare_reader(
     io_buffer_size_bytes: Option<u64>,
     with_frags: bool,
     capture_row_ids: bool,
+    ordering: Option<Vec<ColumnOrdering>>,
 ) -> Result<(
     SendableRecordBatchStream,
     Option<std::sync::mpsc::Receiver<CapturedRowIds>>,
@@ -920,6 +934,13 @@ async fn prepare_reader(
         scanner
             .with_fragments(fragments.to_vec())
             .scan_in_order(true);
+    }
+    // A top-level ordering re-sorts the whole scan (spill-capable), so the
+    // stream — and the captured `_rowid` order — comes out clustered. This
+    // overrides the in-order read above; the row id capture below sees the
+    // post-sort order, which is what the new fragments are written from.
+    if let Some(ordering) = ordering {
+        scanner.order_by(Some(ordering))?;
     }
     if capture_row_ids {
         scanner.with_row_id();
@@ -1173,6 +1194,30 @@ async fn rewrite_files(
         .sum::<u64>();
     // If we aren't using stable row ids, then we need to remap indices.
     let needs_remapping = !dataset.manifest.uses_stable_row_ids();
+
+    // When `sort_by` is set, build the scan ordering and force `_rowid` capture
+    // so the post-sort order is carried onto the new fragments. Sorting reorders
+    // rows, which the positional stable-row-id rechunk cannot handle, so it is
+    // only supported with stable row ids (where the captured sequence replaces
+    // the positional rechunk).
+    let ordering = options
+        .sort_by
+        .as_ref()
+        .filter(|cols| !cols.is_empty())
+        .map(|cols| {
+            cols.iter()
+                .cloned()
+                .map(ColumnOrdering::asc_nulls_first)
+                .collect::<Vec<_>>()
+        });
+    let sorting = ordering.is_some();
+    if sorting && !dataset.manifest.uses_stable_row_ids() {
+        return Err(Error::invalid_input(
+            "compaction sort_by requires the dataset to use stable row ids",
+        ));
+    }
+    let capture_for_sort = sorting && dataset.manifest.uses_stable_row_ids();
+
     let mut new_fragments: Vec<Fragment>;
     let task_id = uuid::Uuid::new_v4();
     log::info!(
@@ -1182,7 +1227,10 @@ async fn rewrite_files(
         fragments.len()
     );
     let mode = options.compaction_mode();
-    let can_binary_copy = can_use_binary_copy(dataset.as_ref(), options, &fragments).await;
+    // Binary copy relocates encoded pages verbatim and cannot reorder rows, so
+    // it is incompatible with sorting.
+    let can_binary_copy =
+        !sorting && can_use_binary_copy(dataset.as_ref(), options, &fragments).await;
     if !can_binary_copy && matches!(mode, CompactionMode::ForceBinaryCopy) {
         return Err(Error::not_supported_source(
             format!("compaction task {}: binary copy is not supported", task_id).into(),
@@ -1198,7 +1246,8 @@ async fn rewrite_files(
             options.batch_size,
             options.io_buffer_size_bytes,
             true,
-            needs_remapping,
+            needs_remapping || capture_for_sort,
+            ordering,
         )
         .await?;
         row_ids_rx = rx_initial;
@@ -1290,10 +1339,31 @@ async fn rewrite_files(
             let captured_ids = row_ids_rx
                 .try_recv()
                 .map_err(|err| Error::internal(format!("Failed to receive row ids: {}", err)))?;
-            let row_addrs = captured_ids.row_addrs(None).into_owned();
-            let mut serialized = Vec::with_capacity(row_addrs.serialized_size());
-            row_addrs.serialize_into(&mut serialized)?;
-            Ok(Some(serialized))
+            match captured_ids {
+                // Stable-row-id sorted compaction: the captured sequence is already
+                // in post-sort output order, so chunk it straight onto the new
+                // fragments. This replaces `rechunk_stable_row_ids`, whose positional
+                // rechunk assumes output order == scan order and would misassign row
+                // ids once the rows are reordered.
+                CapturedRowIds::SequenceStyle(sequence) => {
+                    log::info!("Compaction task {}: assigning sorted stable row ids", task_id);
+                    assign_stable_row_ids_from_sequence(&mut new_fragments, sequence)?;
+                    recalc_versions_for_rewritten_fragments(
+                        dataset.as_ref(),
+                        &mut new_fragments,
+                        &fragments,
+                        true,
+                    )
+                    .await?;
+                    Ok(None)
+                }
+                addr @ CapturedRowIds::AddressStyle(_) => {
+                    let row_addrs = addr.row_addrs(None).into_owned();
+                    let mut serialized = Vec::with_capacity(row_addrs.serialized_size());
+                    row_addrs.serialize_into(&mut serialized)?;
+                    Ok(Some(serialized))
+                }
+            }
         } else {
             if dataset.manifest.uses_stable_row_ids() {
                 log::info!("Compaction task {}: rechunking stable row ids", task_id);
@@ -1302,6 +1372,7 @@ async fn rewrite_files(
                     dataset.as_ref(),
                     &mut new_fragments,
                     &fragments,
+                    false,
                 )
                 .await?;
             }
@@ -1403,11 +1474,47 @@ async fn rechunk_stable_row_ids(
     Ok(())
 }
 
+/// Assign stable row id sequences to freshly-written fragments from a captured,
+/// already-ordered sequence — the post-sort output order produced by a sorted
+/// compaction.
+///
+/// Unlike [`rechunk_stable_row_ids`], which rechunks the *old* per-fragment
+/// sequences positionally (and so assumes the new fragments hold rows in scan
+/// order), this consumes the row ids exactly as the rows were written. The
+/// `_rowid` was captured travelling alongside its row through the sort, so each
+/// row keeps its id after reordering. Deleted rows never enter the scan, so the
+/// captured sequence is already deletion-free and needs no masking.
+fn assign_stable_row_ids_from_sequence(
+    new_fragments: &mut [Fragment],
+    captured: lance_table::rowids::RowIdSequence,
+) -> Result<()> {
+    let new_sequences = lance_table::rowids::rechunk_sequences(
+        std::iter::once(captured),
+        new_fragments
+            .iter()
+            .map(|frag| frag.physical_rows.unwrap() as u64),
+        false,
+    )?;
+
+    for (fragment, sequence) in new_fragments.iter_mut().zip(new_sequences) {
+        let serialized = lance_table::rowids::write_row_ids(&sequence);
+        fragment.row_id_meta = Some(RowIdMeta::Inline(serialized));
+    }
+
+    Ok(())
+}
+
 /// After row id rechunking, preserve per-row latest update versions by masking deletions and rechunking
 async fn recalc_versions_for_rewritten_fragments(
     dataset: &Dataset,
     new_fragments: &mut [Fragment],
     old_fragments: &[Fragment],
+    // When the rewrite reordered rows (sorted compaction), the per-row version
+    // sequences are NOT carried through the sort, so the positional rechunk
+    // below would misassign versions to rows unless every sequence is uniform
+    // (a single run — the only shape appends produce). Guard that invariant
+    // loudly rather than silently corrupting versions.
+    require_uniform: bool,
 ) -> Result<()> {
     // Load old per-row last_updated_at version sequences
     let mut old_last_updated_sequences: Vec<lance_table::format::RowDatasetVersionSequence> =
@@ -1453,6 +1560,16 @@ async fn recalc_versions_for_rewritten_fragments(
             let deletions = read_dataset_deletion_file(dataset, frag.id, deletion_file).await?;
             last_updated_seq.mask(deletions.to_sorted_iter())?;
             created_at_seq.mask(deletions.to_sorted_iter())?;
+        }
+
+        if require_uniform && (created_at_seq.runs.len() > 1 || last_updated_seq.runs.len() > 1) {
+            return Err(Error::invalid_input(format!(
+                "sorted compaction requires uniform per-row version sequences, but fragment {} \
+                 carries non-uniform versions (created_at runs: {}, last_updated runs: {})",
+                frag.id,
+                created_at_seq.runs.len(),
+                last_updated_seq.runs.len(),
+            )));
         }
 
         old_last_updated_sequences.push(last_updated_seq);
