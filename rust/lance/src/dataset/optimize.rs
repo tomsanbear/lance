@@ -279,6 +279,7 @@ impl CompactionOptions {
     /// - `lance.compaction.binary_copy_read_batch_bytes`
     /// - `lance.compaction.max_source_fragments`
     /// - `lance.compaction.io_buffer_size_bytes`
+    /// - `lance.compaction.sort_by` (comma-separated clustering column names)
     pub fn from_dataset_config(config: &HashMap<String, String>) -> Result<Self> {
         let mut opts = Self::default();
         opts.apply_dataset_config(config)?;
@@ -385,6 +386,16 @@ impl CompactionOptions {
                             key, value
                         ))
                     })?);
+                }
+                "sort_by" => {
+                    // Comma-separated clustering column names; empty clears it.
+                    let cols: Vec<String> = value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                    self.sort_by = (!cols.is_empty()).then_some(cols);
                 }
                 _ => {
                     warn!("Ignoring unknown compaction config key: {}", key);
@@ -1805,13 +1816,14 @@ mod tests {
     use arrow_array::types::{Float32Type, Float64Type, Int32Type, Int64Type};
     use arrow_array::{
         ArrayRef, Float32Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
-        PrimitiveArray, RecordBatch, RecordBatchIterator,
+        PrimitiveArray, RecordBatch, RecordBatchIterator, UInt64Array,
     };
     use arrow_schema::{DataType, Field, Schema};
     use arrow_select::concat::concat_batches;
     use async_trait::async_trait;
     use lance_arrow::BLOB_META_KEY;
     use lance_core::Error;
+    use lance_core::ROW_ID;
     use lance_core::utils::address::RowAddress;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::Dimension;
@@ -2639,6 +2651,113 @@ mod tests {
 
         let after_scalar_result = scalar_query(&dataset).await;
         assert_eq!(before_scalar_result, after_scalar_result);
+    }
+
+    /// Read `(row_id -> (key, payload))` for every live row. Used to prove the
+    /// stable row id ↔ row-content mapping is preserved across a sorted
+    /// compaction (the row id must travel with its row through the sort).
+    async fn read_rowid_rows(dataset: &Dataset) -> std::collections::BTreeMap<u64, (i32, i32)> {
+        let mut scanner = dataset.scan();
+        scanner.project(&["key", "payload"]).unwrap().with_row_id();
+        let batch = scanner.try_into_batch().await.unwrap();
+        let row_ids = batch
+            .column_by_name(ROW_ID)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let keys = batch
+            .column_by_name("key")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let payloads = batch
+            .column_by_name("payload")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        (0..batch.num_rows())
+            .map(|i| (row_ids.value(i), (keys.value(i), payloads.value(i))))
+            .collect()
+    }
+
+    /// Read the `key` column in physical storage order (one coalesced fragment
+    /// after compaction), so an ascending result proves the rows were clustered.
+    async fn read_keys_in_order(dataset: &Dataset) -> Vec<i32> {
+        let mut scanner = dataset.scan();
+        scanner.scan_in_order(true).project(&["key"]).unwrap();
+        let batch = scanner.try_into_batch().await.unwrap();
+        let keys = batch
+            .column_by_name("key")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        (0..batch.num_rows()).map(|i| keys.value(i)).collect()
+    }
+
+    #[tokio::test]
+    async fn test_compact_sort_by_preserves_stable_row_ids() {
+        // Shuffled key column so sorting genuinely reorders rows, spread across
+        // several fragments. Stable row ids force the capture-based reorder path
+        // (not the positional rechunk); payload = key * 100 lets us assert the
+        // whole row travels with its id.
+        let keys: Vec<i32> =
+            vec![7, 3, 9, 1, 5, 8, 0, 6, 2, 4, 17, 13, 19, 11, 15, 18, 10, 16, 12, 14];
+        let payload: Vec<i32> = keys.iter().map(|k| k * 100).collect();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int32, false),
+            Field::new("payload", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(keys.clone())) as ArrayRef,
+                Arc::new(Int32Array::from(payload)) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+
+        let mut dataset = Dataset::write(
+            reader,
+            "memory://test/sorted_compact",
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                max_rows_per_file: 5, // 4 fragments
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let before = read_rowid_rows(&dataset).await;
+        assert_eq!(before.len(), keys.len());
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1000, // coalesce to a single sorted fragment
+            sort_by: Some(vec!["key".to_string()]),
+            ..Default::default()
+        };
+        compact_files(&mut dataset, options, None).await.unwrap();
+
+        // Row ids preserved: every id still maps to the same (key, payload).
+        let after = read_rowid_rows(&dataset).await;
+        assert_eq!(
+            before, after,
+            "stable row id -> row content map changed across sorted compaction"
+        );
+
+        // Rows clustered: physical order is ascending by key.
+        let ordered_keys = read_keys_in_order(&dataset).await;
+        let mut sorted = ordered_keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            ordered_keys, sorted,
+            "rows were not clustered by key after sorted compaction"
+        );
     }
 
     // Regression test for https://github.com/lancedb/lance/issues/6161
