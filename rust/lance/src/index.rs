@@ -505,6 +505,7 @@ pub(crate) async fn remap_index(
                             None,
                             true, // Legacy reindexing should always train
                             None,
+                            None,
                         )
                         .await?;
                         InvertedIndexPlugin::train_inverted_index(

@@ -403,6 +403,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         None,
                         true,
                         None,
+                        None,
                     )
                     .await?;
                     let new_uuid = Uuid::new_v4();
@@ -415,6 +416,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         None,
                         Some(new_data_stream),
                         Arc::new(NoopIndexBuildProgress),
+                        None,
                     )
                     .await?;
                     return Ok(Some(IndexMergeResults {
@@ -434,6 +436,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     &update_criteria.data_criteria,
                     fragments,
                     true,
+                    None,
                     None,
                 )
                 .await?;
@@ -494,6 +497,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         None,
                         Some(new_data_stream),
                         Arc::new(NoopIndexBuildProgress),
+                        None,
                     )
                     .await?
                 } else {
@@ -563,6 +567,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     fragments,
                     true,
                     None,
+                    None,
                 )
                 .await?;
 
@@ -581,6 +586,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         None,
                         Some(new_data_stream),
                         Arc::new(NoopIndexBuildProgress),
+                        None,
                     )
                     .await?
                 } else {

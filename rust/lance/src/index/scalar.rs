@@ -118,6 +118,7 @@ pub(crate) async fn scan_training_data(
     column: &str,
     criteria: &TrainingCriteria,
     fragments: Option<Vec<Fragment>>,
+    mem_pool_size: Option<u64>,
 ) -> Result<SendableRecordBatchStream> {
     let num_rows = dataset.count_all_rows().await?;
 
@@ -149,6 +150,7 @@ pub(crate) async fn scan_training_data(
     let batches = scan
         .try_into_dfstream(LanceExecutionOptions {
             use_spilling: true,
+            mem_pool_size,
             ..Default::default()
         })
         .await?;
@@ -184,6 +186,7 @@ pub(crate) async fn load_training_data(
     fragments: Option<Vec<Fragment>>,
     train: bool,
     fragment_ids: Option<Vec<u32>>,
+    mem_pool_size: Option<u64>,
 ) -> Result<SendableRecordBatchStream> {
     // Create training request with fragment_ids if provided
     let training_request = Box::new(match fragment_ids.clone() {
@@ -217,9 +220,9 @@ pub(crate) async fn load_training_data(
                     Ok(frag.metadata().clone())
                 })
                 .collect();
-            scan_training_data(dataset, column, criteria, Some(frags?)).await
+            scan_training_data(dataset, column, criteria, Some(frags?), mem_pool_size).await
         } else {
-            scan_training_data(dataset, column, criteria, fragments).await
+            scan_training_data(dataset, column, criteria, fragments, mem_pool_size).await
         }
     } else {
         TrainingRequest::create_empty_stream(dataset, column, criteria).await
@@ -276,6 +279,7 @@ pub(super) async fn build_scalar_index(
     fragment_ids: Option<Vec<u32>>,
     preprocessed_data: Option<SendableRecordBatchStream>,
     progress: Arc<dyn IndexBuildProgress>,
+    mem_pool_size: Option<u64>,
 ) -> Result<CreatedIndex> {
     let field = dataset
         .schema()
@@ -302,6 +306,7 @@ pub(super) async fn build_scalar_index(
                 None,
                 train,
                 fragment_ids.clone(),
+                mem_pool_size,
             )
             .await?
         }
@@ -1005,6 +1010,7 @@ mod tests {
             &TrainingCriteria::new(TrainingOrdering::Addresses).with_row_addr(),
             None,
             true,
+            None,
             None,
         )
         .await

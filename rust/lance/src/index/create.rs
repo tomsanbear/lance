@@ -63,6 +63,8 @@ pub struct CreateIndexBuilder<'a> {
     progress: Arc<dyn IndexBuildProgress>,
     /// Transaction properties to store with this commit.
     transaction_properties: Option<Arc<HashMap<String, String>>>,
+    /// Optional sort/aggregate spill pool size in bytes for this index build.
+    mem_pool_size: Option<u64>,
 }
 
 impl<'a> CreateIndexBuilder<'a> {
@@ -85,6 +87,7 @@ impl<'a> CreateIndexBuilder<'a> {
             preprocessed_data: None,
             progress: Arc::new(NoopIndexBuildProgress),
             transaction_properties: None,
+            mem_pool_size: None,
         }
     }
 
@@ -133,6 +136,18 @@ impl<'a> CreateIndexBuilder<'a> {
     /// (e.g., job_id for tracking completed index jobs).
     pub fn transaction_properties(mut self, properties: HashMap<String, String>) -> Self {
         self.transaction_properties = Some(Arc::new(properties));
+        self
+    }
+
+    /// Set the sort/aggregate spill pool size in bytes for this index build.
+    ///
+    /// Passed as `mem_pool_size` to `LanceExecutionOptions` when the build
+    /// reads training data via DataFusion. Defaults to Lance's global pool
+    /// (controlled by `LANCE_MEM_POOL_SIZE` env var, 100 MiB if unset).
+    /// On memory-constrained hosts, set this from operator config rather than
+    /// relying on the env var.
+    pub fn mem_pool_size(mut self, size: u64) -> Self {
+        self.mem_pool_size = Some(size);
         self
     }
 
@@ -266,6 +281,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     self.fragments.clone(),
                     preprocesssed_data,
                     self.progress.clone(),
+                    self.mem_pool_size,
                 )
                 .await?
             }
@@ -287,6 +303,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     self.fragments.clone(),
                     None,
                     self.progress.clone(),
+                    self.mem_pool_size,
                 )
                 .await?
             }
@@ -313,6 +330,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     self.fragments.clone(),
                     None,
                     self.progress.clone(),
+                    self.mem_pool_size,
                 )
                 .await?
             }
@@ -351,6 +369,7 @@ impl<'a> CreateIndexBuilder<'a> {
                             fri,
                             fragments,
                             self.progress.clone(),
+                            self.mem_pool_size,
                         ))
                         .await?;
                         output_index_uuid = segment_uuid;
@@ -364,6 +383,7 @@ impl<'a> CreateIndexBuilder<'a> {
                             vec_params,
                             fri,
                             self.progress.clone(),
+                            self.mem_pool_size,
                         ))
                         .await?;
                     }
@@ -375,6 +395,7 @@ impl<'a> CreateIndexBuilder<'a> {
                         &index_name,
                         &index_id.to_string(),
                         vec_params,
+                        self.mem_pool_size,
                     )
                     .await?;
                 }
