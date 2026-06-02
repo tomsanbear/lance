@@ -320,6 +320,11 @@ struct MergeInsertParams {
     source_dedupe_behavior: SourceDedupeBehavior,
     // Number of inner commit retries for manifest version conflicts. Default is 20.
     commit_retries: Option<u32>,
+    // Per-scanner io_buffer_size for internal read scans the merge operation
+    // opens against the target dataset (PK-matched fragment scans, full-schema
+    // exec construction). `None` keeps Lance's scheduler default
+    // (`DEFAULT_IO_BUFFER_SIZE_VALUE` = 2 GiB).
+    io_buffer_size_bytes: Option<u64>,
 }
 
 /// A MergeInsertJob inserts new rows, deletes old rows, and updates existing rows all as
@@ -440,8 +445,22 @@ impl MergeInsertBuilder {
                 use_index: true,
                 source_dedupe_behavior: SourceDedupeBehavior::Fail,
                 commit_retries: None,
+                io_buffer_size_bytes: None,
             },
         })
+    }
+
+    /// Set the per-scanner io_buffer_size applied to internal read scans
+    /// opened against the target dataset during the merge operation.
+    ///
+    /// `None` (default) keeps Lance's scheduler default
+    /// (`DEFAULT_IO_BUFFER_SIZE_VALUE` = 2 GiB). Lowering this bounds the
+    /// total in-flight bytes per scanner — useful for high-concurrency
+    /// upsert workloads where the default cap × concurrency exhausts
+    /// process memory.
+    pub fn io_buffer_size_bytes(&mut self, bytes: Option<u64>) -> &mut Self {
+        self.params.io_buffer_size_bytes = bytes;
+        self
     }
 
     /// Specify what should happen when a target row matches a row in the source
@@ -701,6 +720,9 @@ impl MergeInsertJob {
             if add_row_addr {
                 builder.with_row_address();
             }
+            if let Some(io_buf) = self.params.io_buffer_size_bytes {
+                builder.io_buffer_size(io_buf);
+            }
             let unindexed_data = builder
                 .with_row_id()
                 .with_fragments(unindexed_fragments)
@@ -805,7 +827,16 @@ impl MergeInsertJob {
 
         match self.check_compatible_schema(&schema)? {
             SchemaComparison::FullCompatible => {
-                let existing = session_ctx.read_lance(self.dataset.clone(), true, false)?;
+                // Construct the LanceTableProvider directly (instead of via
+                // `read_lance`) so we can apply the merge insert's
+                // `io_buffer_size_bytes` cap to the internal scanner.
+                let provider = crate::datafusion::LanceTableProvider::new(
+                    self.dataset.clone(),
+                    true,
+                    false,
+                )
+                .with_io_buffer_size_bytes(self.params.io_buffer_size_bytes);
+                let existing = session_ctx.read_table(Arc::new(provider))?;
                 // We need to rename the columns from the target table so that they don't conflict with the source table
                 let existing = Self::prefix_columns(existing, "target_");
                 let joined =
@@ -813,7 +844,13 @@ impl MergeInsertJob {
                 Ok(joined.execute_stream().await?)
             }
             SchemaComparison::Subschema => {
-                let existing = session_ctx.read_lance(self.dataset.clone(), true, true)?;
+                let provider = crate::datafusion::LanceTableProvider::new(
+                    self.dataset.clone(),
+                    true,
+                    true,
+                )
+                .with_io_buffer_size_bytes(self.params.io_buffer_size_bytes);
+                let existing = session_ctx.read_table(Arc::new(provider))?;
                 let columns = schema
                     .field_names()
                     .iter()
@@ -1325,7 +1362,17 @@ impl MergeInsertJob {
         //       indexed vs non-indexed cases. That should be handled by optimizer rules.
         let session_config = SessionConfig::default();
         let session_ctx = SessionContext::new_with_config(session_config);
-        let scan = session_ctx.read_lance_unordered(self.dataset.clone(), true, true)?;
+        // Construct LanceTableProvider directly (instead of via
+        // `read_lance_unordered`) so the merge insert's `io_buffer_size_bytes`
+        // cap reaches the internal scanner.
+        let provider = crate::datafusion::LanceTableProvider::new_with_ordering(
+            self.dataset.clone(),
+            true,
+            true,
+            false,
+        )
+        .with_io_buffer_size_bytes(self.params.io_buffer_size_bytes);
+        let scan = session_ctx.read_table(Arc::new(provider))?;
         // Wrap column names in double quotes to preserve case (DataFusion lowercases unquoted identifiers)
         let on_cols = self
             .params

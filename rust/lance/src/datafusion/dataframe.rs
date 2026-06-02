@@ -42,6 +42,7 @@ pub struct LanceTableProvider {
     row_id_idx: Option<usize>,
     row_addr_idx: Option<usize>,
     ordered: bool,
+    io_buffer_size_bytes: Option<u64>,
 }
 
 impl LanceTableProvider {
@@ -72,7 +73,16 @@ impl LanceTableProvider {
             row_id_idx,
             row_addr_idx,
             ordered,
+            io_buffer_size_bytes: None,
         }
+    }
+
+    /// Set the per-scanner io_buffer_size applied when this provider's `scan`
+    /// constructs a Lance `Scanner`. `None` keeps the Lance scheduler default
+    /// (`DEFAULT_IO_BUFFER_SIZE_VALUE` = 2 GiB).
+    pub fn with_io_buffer_size_bytes(mut self, bytes: Option<u64>) -> Self {
+        self.io_buffer_size_bytes = bytes;
+        self
     }
 
     pub fn dataset(&self) -> Arc<Dataset> {
@@ -140,6 +150,9 @@ impl TableProvider for LanceTableProvider {
         }
         scan.limit(limit.map(|l| l as i64), None)?;
         scan.scan_in_order(self.ordered);
+        if let Some(io_buf) = self.io_buffer_size_bytes {
+            scan.io_buffer_size(io_buf);
+        }
 
         scan.create_plan().await.map_err(DataFusionError::from)
     }
