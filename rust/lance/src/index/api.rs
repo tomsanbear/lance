@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
-use lance_index::{IndexParams, IndexType, PrewarmOptions, optimize::OptimizeOptions};
+use lance_index::{Index, IndexParams, IndexType, PrewarmOptions, optimize::OptimizeOptions};
 use lance_table::format::IndexMetadata;
 use roaring::RoaringBitmap;
 use uuid::Uuid;
@@ -319,6 +319,26 @@ pub trait DatasetIndexExt {
         partition_id: usize,
         with_vector: bool,
     ) -> Result<SendableRecordBatchStream>;
+
+    /// Open a scalar index by name and return its [`Index`] trait object.
+    ///
+    /// This allows reading index metadata and statistics without performing a query.
+    /// Useful for query optimizers that need column statistics from zonemap indices.
+    ///
+    /// # Arguments
+    /// * `column` — the column name the index is built on (used to disambiguate when
+    ///   the same name resolves to multiple indices on different columns).
+    /// * `index_name` — the name of the index (e.g., `"idx_price_zonemap"`).
+    ///
+    /// # Returns
+    /// * `Ok(Some(index))` — index found and opened successfully
+    /// * `Ok(None)` — no index with that name exists for the column
+    /// * `Err(_)` — error opening the index
+    async fn open_scalar_index_by_name(
+        &self,
+        column: &str,
+        index_name: &str,
+    ) -> Result<Option<Arc<dyn Index>>>;
 }
 
 #[cfg(test)]

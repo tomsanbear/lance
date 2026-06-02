@@ -2454,4 +2454,686 @@ mod tests {
                     && idx.fragment_bitmap.as_ref().unwrap().len() == 1)
         );
     }
+
+    // ========================================================================
+    // Compound (multi-column) scalar index integration tests
+    //
+    // These exercise the integration layer:
+    //   CreateIndexBuilder::execute_uncommitted (multi-column branch)
+    //     -> build_compound_btree_index
+    //     -> CompoundBTreeIndexPlugin
+    //     -> manifest persistence
+    //     -> infer_scalar_index_details (CompoundBTreeIndexDetails)
+    //     -> ScalarIndexInfo::get_compound_index (planner path)
+    //     -> remap_index path (compaction + frag-reuse)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_create_compound_index() {
+        use crate::Dataset;
+        use crate::index::DatasetIndexInternalExt;
+        use lance_index::scalar::ScalarIndexParams;
+
+        // Use a fresh temp dir; file:// URI form so writer + reader both round-trip.
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("tenant_id", DataType::Utf8, false),
+            ArrowField::new("status", DataType::Utf8, false),
+            ArrowField::new("value", DataType::Int32, false),
+        ]));
+
+        let tenant_ids: Vec<&str> = (0..100)
+            .map(|i| match i % 3 {
+                0 => "acme",
+                1 => "globex",
+                _ => "initech",
+            })
+            .collect();
+        let statuses: Vec<&str> = (0..100)
+            .map(|i| if i % 2 == 0 { "active" } else { "inactive" })
+            .collect();
+        let values: Vec<i32> = (0..100).collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(tenant_ids)),
+                Arc::new(StringArray::from(statuses)),
+                Arc::new(Int32Array::from(values)),
+            ],
+        )
+        .unwrap();
+
+        let write_params = WriteParams {
+            max_rows_per_file: 50,
+            max_rows_per_group: 25,
+            ..Default::default()
+        };
+
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(batches, &dataset_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        let params = ScalarIndexParams::default();
+        dataset
+            .create_index(
+                &["tenant_id", "status"],
+                IndexType::BTree,
+                Some("compound_idx".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        assert_eq!(indices.len(), 1);
+
+        let compound_idx = &indices[0];
+        assert_eq!(compound_idx.name, "compound_idx");
+        assert_eq!(
+            compound_idx.fields.len(),
+            2,
+            "Compound index should have 2 fields"
+        );
+
+        // Verify the details type URL — confirms execute_uncommitted dispatched
+        // to build_compound_btree_index and that infer_scalar_index_details
+        // returned CompoundBTreeIndexDetails.
+        let index_details = compound_idx
+            .index_details
+            .as_ref()
+            .expect("should have details");
+        assert!(
+            index_details.type_url.contains("CompoundBTreeIndexDetails"),
+            "Index details should be CompoundBTreeIndexDetails, got: {}",
+            index_details.type_url
+        );
+
+        // Smoke-test open_scalar_index_by_name: it should resolve to the same
+        // compound index we just created. Returns Some(index) on hit, None on
+        // miss; this verifies the trait method on DatasetIndexExt wires
+        // through to the internal open path.
+        let by_name = dataset
+            .open_scalar_index_by_name("tenant_id", "compound_idx")
+            .await
+            .unwrap();
+        assert!(by_name.is_some(), "open_scalar_index_by_name should find compound_idx");
+
+        let missing = dataset
+            .open_scalar_index_by_name("tenant_id", "no_such_index")
+            .await
+            .unwrap();
+        assert!(missing.is_none(), "open_scalar_index_by_name should return None for unknown name");
+
+        // Cross-check that the same uuid reads correctly through the internal
+        // open_scalar_index path used by query execution, and pin the
+        // reported `index_type()` so this contract can't drift silently.
+        //
+        // NOTE: compound BTree currently reports `IndexType::Scalar` (the
+        // legacy generic alias, see `crate::IndexType` enum: `Scalar = 0`
+        // commented as "Legacy scalar index, alias to BTree"). Every other
+        // scalar index plugin returns its specific variant (BTree → BTree,
+        // Bitmap → Bitmap, ZoneMap → ZoneMap, …), so this is an asymmetry
+        // worth knowing about: a downstream `match` on `IndexType::BTree`
+        // will skip the compound index. There is no `IndexType::CompoundBTree`
+        // variant today; introducing one would affect the on-disk wire
+        // format. Until that's addressed, callers should treat `Scalar` from
+        // an opened multi-column index as "compound BTree".
+        let scalar_index = dataset
+            .open_scalar_index(
+                "tenant_id",
+                &compound_idx.uuid.to_string(),
+                &lance_index::metrics::NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            scalar_index.index_type(),
+            IndexType::Scalar,
+            "compound BTree reports `Scalar` today; if this changes (e.g. \
+             a new `IndexType::CompoundBTree` variant is added), update the \
+             callers that pattern-match on the index type"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_compound_index_rejects_unsupported_types() {
+        use crate::Dataset;
+        use crate::index::vector::VectorIndexParams;
+
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("col1", DataType::Utf8, false),
+            ArrowField::new("col2", DataType::Utf8, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                Arc::new(StringArray::from(vec!["x", "y", "z"])),
+            ],
+        )
+        .unwrap();
+
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(batches, &dataset_uri, None).await.unwrap();
+
+        // Vector index type with multi-column input must error out before
+        // hitting the compound branch (vector indices are inherently single-column).
+        let params = VectorIndexParams::ivf_flat(8, MetricType::Cosine);
+        let result = dataset
+            .create_index(
+                &["col1", "col2"],
+                IndexType::Vector,
+                None,
+                &params,
+                false,
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "Vector index should not support multiple columns"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("does not support multiple columns"),
+            "Error should mention multi-column not supported: {}",
+            err
+        );
+    }
+
+    /// End-to-end search correctness via CompoundSargableQuery::PrefixLookup.
+    ///
+    /// This exercises the search path that compound_btree.rs unit tests cannot
+    /// reach — going through create_index, manifest persistence, and reopening
+    /// via open_scalar_index. Any divergence between the index data layout the
+    /// trainer writes and the layout the reader expects shows up here.
+    #[tokio::test]
+    async fn test_compound_index_search_cartesian_product() {
+        use crate::Dataset;
+        use crate::index::DatasetIndexInternalExt;
+        use datafusion::common::ScalarValue;
+        use lance_index::metrics::NoOpMetricsCollector;
+        use lance_index::scalar::ScalarIndexParams;
+        use lance_index::scalar::compound::CompoundSargableQuery;
+
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        // 6 rows: cartesian product of {acme, beta, gamma} × {active, inactive}
+        // with row index inferred from row order:
+        //   row 0: (acme, active, 100)
+        //   row 1: (acme, active, 200)
+        //   row 2: (acme, inactive, 300)
+        //   row 3: (beta, active, 400)
+        //   row 4: (beta, inactive, 500)
+        //   row 5: (gamma, active, 600)
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("tenant_id", DataType::Utf8, false),
+            ArrowField::new("status", DataType::Utf8, false),
+            ArrowField::new("value", DataType::Int32, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "acme", "acme", "acme", "beta", "beta", "gamma",
+                ])),
+                Arc::new(StringArray::from(vec![
+                    "active", "active", "inactive", "active", "inactive", "active",
+                ])),
+                Arc::new(Int32Array::from(vec![100, 200, 300, 400, 500, 600])),
+            ],
+        )
+        .unwrap();
+
+        let batches = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        let mut dataset = Dataset::write(batches, &dataset_uri, None).await.unwrap();
+
+        let params = ScalarIndexParams::default();
+        dataset
+            .create_index(
+                &["tenant_id", "status"],
+                IndexType::BTree,
+                Some("idx_tenant_status".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        let compound_idx = &indices[0];
+        let scalar_index = dataset
+            .open_scalar_index(
+                "tenant_id",
+                &compound_idx.uuid.to_string(),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+
+        // Helper: extract returned row_ids from a SearchResult.
+        let collect_row_ids = |result: lance_index::scalar::SearchResult| -> Vec<u64> {
+            result
+                .row_addrs()
+                .true_rows()
+                .row_addrs()
+                .map(|iter| iter.map(u64::from).collect())
+                .unwrap_or_default()
+        };
+
+        // (acme, active) -> rows 0, 1
+        let q = CompoundSargableQuery::PrefixLookup {
+            prefix: vec![
+                ScalarValue::Utf8(Some("acme".into())),
+                ScalarValue::Utf8(Some("active".into())),
+            ],
+            range: None,
+        };
+        let r = scalar_index.search(&q, &NoOpMetricsCollector).await.unwrap();
+        assert_eq!(collect_row_ids(r).len(), 2, "(acme, active) -> 2 rows");
+
+        // (acme, inactive) -> row 2
+        let q = CompoundSargableQuery::PrefixLookup {
+            prefix: vec![
+                ScalarValue::Utf8(Some("acme".into())),
+                ScalarValue::Utf8(Some("inactive".into())),
+            ],
+            range: None,
+        };
+        let r = scalar_index.search(&q, &NoOpMetricsCollector).await.unwrap();
+        assert_eq!(collect_row_ids(r).len(), 1, "(acme, inactive) -> 1 row");
+
+        // (beta, active) -> row 3
+        let q = CompoundSargableQuery::PrefixLookup {
+            prefix: vec![
+                ScalarValue::Utf8(Some("beta".into())),
+                ScalarValue::Utf8(Some("active".into())),
+            ],
+            range: None,
+        };
+        let r = scalar_index.search(&q, &NoOpMetricsCollector).await.unwrap();
+        assert_eq!(collect_row_ids(r).len(), 1, "(beta, active) -> 1 row");
+
+        // (beta, inactive) -> row 4
+        let q = CompoundSargableQuery::PrefixLookup {
+            prefix: vec![
+                ScalarValue::Utf8(Some("beta".into())),
+                ScalarValue::Utf8(Some("inactive".into())),
+            ],
+            range: None,
+        };
+        let r = scalar_index.search(&q, &NoOpMetricsCollector).await.unwrap();
+        assert_eq!(collect_row_ids(r).len(), 1, "(beta, inactive) -> 1 row");
+
+        // Prefix-only on first column: acme -> rows 0, 1, 2
+        let q = CompoundSargableQuery::PrefixLookup {
+            prefix: vec![ScalarValue::Utf8(Some("acme".into()))],
+            range: None,
+        };
+        let r = scalar_index.search(&q, &NoOpMetricsCollector).await.unwrap();
+        assert_eq!(collect_row_ids(r).len(), 3, "prefix (acme) -> 3 rows");
+    }
+
+    /// Compaction with defer_index_remap=true uses the fragment-reuse path.
+    /// This is the path I changed when generalising
+    /// `remap_row_ids_record_batch` from 2 columns to N columns. Without this
+    /// test we have no end-to-end coverage that the compound index correctly
+    /// follows row identity through a compaction.
+    #[tokio::test]
+    async fn test_compound_index_with_compaction_and_fragment_reuse() {
+        use crate::Dataset;
+        use crate::dataset::optimize::{CompactionOptions, compact_files};
+        use crate::index::DatasetIndexInternalExt;
+        use datafusion::common::ScalarValue;
+        use lance_index::metrics::NoOpMetricsCollector;
+        use lance_index::scalar::ScalarIndexParams;
+        use lance_index::scalar::compound::CompoundSargableQuery;
+
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("tenant_id", DataType::Utf8, false),
+            ArrowField::new("status", DataType::Utf8, false),
+            ArrowField::new("value", DataType::Int32, false),
+        ]));
+
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["acme", "acme", "beta"])),
+                Arc::new(StringArray::from(vec!["active", "inactive", "active"])),
+                Arc::new(Int32Array::from(vec![100, 200, 300])),
+            ],
+        )
+        .unwrap();
+
+        let write_params = WriteParams {
+            max_rows_per_file: 3,
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new(vec![Ok(batch1)], schema.clone());
+        Dataset::write(batches, &dataset_uri, Some(write_params.clone()))
+            .await
+            .unwrap();
+
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["beta", "gamma", "gamma"])),
+                Arc::new(StringArray::from(vec!["inactive", "active", "inactive"])),
+                Arc::new(Int32Array::from(vec![400, 500, 600])),
+            ],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![Ok(batch2)], schema.clone());
+        let mut dataset = Dataset::write(
+            batches,
+            &dataset_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                max_rows_per_file: 3,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.fragments().len(), 2, "two fragments before compaction");
+
+        let params = ScalarIndexParams::default();
+        dataset
+            .create_index(
+                &["tenant_id", "status"],
+                IndexType::BTree,
+                Some("idx_compound".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        let compound_idx = indices.iter().find(|i| i.name == "idx_compound").unwrap();
+        assert_eq!(compound_idx.fields.len(), 2);
+
+        // Query before compaction.
+        let scalar_index = dataset
+            .open_scalar_index(
+                "tenant_id",
+                &compound_idx.uuid.to_string(),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+
+        let q = CompoundSargableQuery::PrefixLookup {
+            prefix: vec![
+                ScalarValue::Utf8(Some("beta".into())),
+                ScalarValue::Utf8(Some("active".into())),
+            ],
+            range: None,
+        };
+        let result_before = scalar_index.search(&q, &NoOpMetricsCollector).await.unwrap();
+        let row_ids_before: Vec<u64> = result_before
+            .row_addrs()
+            .true_rows()
+            .row_addrs()
+            .map(|iter| iter.map(u64::from).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            row_ids_before.len(),
+            1,
+            "(beta, active) -> 1 row before compaction"
+        );
+
+        // Compact with defer_index_remap=true; this triggers the fragment-reuse
+        // remap path that calls remap_row_ids_record_batch on the compound
+        // index's (col0, col1, ..., row_id) schema. Pre-fix this would have
+        // asserted the schema had exactly 2 columns; post-fix it must work for
+        // any number of columns.
+        let compaction_options = CompactionOptions {
+            defer_index_remap: true,
+            ..Default::default()
+        };
+        compact_files(&mut dataset, compaction_options, None)
+            .await
+            .unwrap();
+
+        dataset = Dataset::open(&dataset_uri).await.unwrap();
+        assert_eq!(dataset.fragments().len(), 1, "one fragment after compaction");
+
+        let indices_after = dataset.load_indices().await.unwrap();
+        let compound_idx_after = indices_after
+            .iter()
+            .find(|idx| idx.name == "idx_compound")
+            .expect("compound index should survive compaction");
+        let scalar_index_after = dataset
+            .open_scalar_index(
+                "tenant_id",
+                &compound_idx_after.uuid.to_string(),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+
+        let q = CompoundSargableQuery::PrefixLookup {
+            prefix: vec![
+                ScalarValue::Utf8(Some("beta".into())),
+                ScalarValue::Utf8(Some("active".into())),
+            ],
+            range: None,
+        };
+        let result_after = scalar_index_after
+            .search(&q, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let row_ids_after: Vec<u64> = result_after
+            .row_addrs()
+            .true_rows()
+            .row_addrs()
+            .map(|iter| iter.map(u64::from).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            row_ids_after.len(),
+            1,
+            "(beta, active) -> still 1 row after compaction via fragment reuse"
+        );
+
+        // Final verify: row identity preserved through compaction.
+        let projection = crate::dataset::ProjectionRequest::from_columns(
+            ["tenant_id", "status", "value"],
+            dataset.schema(),
+        );
+        let fetched = dataset.take_rows(&row_ids_after, projection).await.unwrap();
+        assert_eq!(fetched.num_rows(), 1);
+        let tenant_col = fetched
+            .column_by_name("tenant_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(tenant_col.value(0), "beta");
+        let status_col = fetched
+            .column_by_name("status")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(status_col.value(0), "active");
+    }
+
+    /// Compound index with partial fragment coverage exercises the planner's
+    /// compound path: `IndexInformationProvider::get_compound_index` lookup,
+    /// `maybe_compound_prefix` matcher, and row-id resolution for the indexed
+    /// fragment + scan fallback for the unindexed fragment.
+    #[tokio::test]
+    async fn test_compound_index_mixed_fragment_coverage() {
+        use crate::Dataset;
+        use lance_index::scalar::ScalarIndexParams;
+
+        let tmpdir = TempStrDir::default();
+        let dataset_uri = format!("file://{}", tmpdir.as_str());
+
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("tenant_id", DataType::Utf8, false),
+            ArrowField::new("status", DataType::Utf8, false),
+            ArrowField::new("value", DataType::Int32, false),
+        ]));
+
+        let batch1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["acme", "acme", "beta"])),
+                Arc::new(StringArray::from(vec!["active", "inactive", "active"])),
+                Arc::new(Int32Array::from(vec![100, 200, 300])),
+            ],
+        )
+        .unwrap();
+
+        let write_params = WriteParams {
+            max_rows_per_file: 3,
+            ..Default::default()
+        };
+        let batches = RecordBatchIterator::new(vec![Ok(batch1)], schema.clone());
+        let mut dataset = Dataset::write(batches, &dataset_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        // Index covers fragment 0 only.
+        let params = ScalarIndexParams::default();
+        dataset
+            .create_index(
+                &["tenant_id", "status"],
+                IndexType::BTree,
+                Some("idx_compound".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        let frag_bitmap = indices[0].fragment_bitmap.as_ref().unwrap();
+        assert!(frag_bitmap.contains(0), "index covers fragment 0");
+        assert_eq!(frag_bitmap.len(), 1, "index covers only 1 fragment");
+
+        // Append a second fragment without re-indexing.
+        let batch2 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["beta", "gamma", "gamma"])),
+                Arc::new(StringArray::from(vec!["inactive", "active", "inactive"])),
+                Arc::new(Int32Array::from(vec![400, 500, 600])),
+            ],
+        )
+        .unwrap();
+        let batches = RecordBatchIterator::new(vec![Ok(batch2)], schema.clone());
+        Dataset::write(
+            batches,
+            &dataset_uri,
+            Some(WriteParams {
+                mode: WriteMode::Append,
+                max_rows_per_file: 3,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let dataset = Dataset::open(&dataset_uri).await.unwrap();
+        assert_eq!(dataset.fragments().len(), 2);
+        let indices_after = dataset.load_indices().await.unwrap();
+        let frag_bitmap_after = indices_after[0].fragment_bitmap.as_ref().unwrap();
+        assert_eq!(
+            frag_bitmap_after.len(),
+            1,
+            "index still covers exactly 1 fragment after the append"
+        );
+
+        // (beta, active) is in fragment 0 (indexed). Query must find it via
+        // the compound prefix path.
+        let result = dataset
+            .scan()
+            .filter("tenant_id = 'beta' AND status = 'active'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result.num_rows(), 1, "(beta, active) -> 1 row");
+        let value_col = result
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(value_col.value(0), 300, "row from indexed fragment");
+
+        // (gamma, active) lives only in the unindexed fragment. The scanner
+        // must fall back to a full scan for that fragment.
+        let result2 = dataset
+            .scan()
+            .filter("tenant_id = 'gamma' AND status = 'active'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result2.num_rows(), 1, "(gamma, active) -> 1 row from unindexed fragment");
+        let value_col2 = result2
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(value_col2.value(0), 500);
+
+        // tenant_id alone spans both fragments — covers prefix-only path on
+        // the indexed fragment plus full scan on the unindexed one.
+        let result3 = dataset
+            .scan()
+            .filter("tenant_id = 'beta'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result3.num_rows(), 2, "beta spans both fragments");
+        let value_col3 = result3
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let mut values: Vec<i32> = (0..value_col3.len()).map(|i| value_col3.value(i)).collect();
+        values.sort();
+        assert_eq!(values, vec![300, 400]);
+
+        // Predicate-order independence: status before tenant_id must hit the
+        // same compound index.
+        let result_reversed = dataset
+            .scan()
+            .filter("status = 'active' AND tenant_id = 'beta'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(result_reversed.num_rows(), 1);
+        let value_col_reversed = result_reversed
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(value_col_reversed.value(0), 300);
+    }
 }

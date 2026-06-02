@@ -1433,6 +1433,25 @@ impl DatasetIndexExt for Dataset {
             .read_partition(partition_id, with_vector)
             .await
     }
+
+    async fn open_scalar_index_by_name(
+        &self,
+        column: &str,
+        index_name: &str,
+    ) -> Result<Option<Arc<dyn lance_index::Index>>> {
+        let idx_metadata = self
+            .load_scalar_index(IndexCriteria::default().with_name(index_name))
+            .await?;
+        match idx_metadata {
+            Some(metadata) => {
+                let scalar_index = self
+                    .open_scalar_index(column, &metadata.uuid.to_string(), &NoOpMetricsCollector)
+                    .await?;
+                Ok(Some(scalar_index.as_index()))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 fn index_group_is_scalar(dataset: &Dataset, deltas: &[&IndexMetadata]) -> bool {
