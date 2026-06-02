@@ -3,6 +3,7 @@
 
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use deepsize::DeepSizeOf;
@@ -107,6 +108,20 @@ async fn do_with_retry<'a, O>(f: impl Fn() -> BoxFuture<'a, OSResult<O>> + Clone
     }
 }
 
+// Upper bound on how long a single body-stream `.bytes().await` is allowed
+// to run before we treat it as a hung read and retry. object_store doesn't
+// retry on body-stream failures or hangs; without this guard a single
+// stalled HTTP response keeps a `Vec<u8>` allocated indefinitely, which
+// pins all sibling reads in the same `MutableBatch.data_buffers` slot
+// (`scheduler.rs:367`). Catalyzed observed multi-GiB retention at this
+// stack under sustained load before this timeout was added.
+//
+// 30s is well above the healthy ceiling for cloud body reads (typically
+// <10s even for large multi-MiB ranges) and well below the worst-case
+// TCP-layer connection death window. With `download_retry_count` default
+// of 3, worst-case retention per batch is 4 × 30s = 120s.
+const STREAM_BODY_TIMEOUT: Duration = Duration::from_secs(30);
+
 // We have a separate retry loop here.  This is because object_store does not
 // attempt retries on downloads that fail during streaming of the response body.
 //
@@ -122,9 +137,9 @@ async fn do_get_with_outer_retry(
     loop {
         let get_request_clone = get_request.clone();
         let get_result = do_with_retry(move || get_request_clone.get_range()).await?;
-        match get_result.bytes().await {
-            Ok(bytes) => return Ok(bytes),
-            Err(err) => {
+        match tokio::time::timeout(STREAM_BODY_TIMEOUT, get_result.bytes()).await {
+            Ok(Ok(bytes)) => return Ok(bytes),
+            Ok(Err(err)) => {
                 if retries == 0 {
                     log::warn!(
                         "Failed to download {} from {} after {} attempts.  This may indicate that cloud storage is overloaded or your timeout settings are too restrictive.  Error details: {:?}",
@@ -141,6 +156,38 @@ async fn do_get_with_outer_retry(
                     get_request.path(),
                     retries,
                     err
+                );
+                retries -= 1;
+            }
+            Err(_elapsed) => {
+                // Body stream stalled past STREAM_BODY_TIMEOUT. Treat as a
+                // body-stream error and retry. Dropping `get_result` here
+                // drops the partially-streamed Vec<u8>, releasing the
+                // sibling-MutableBatch retention this guard exists to fix.
+                if retries == 0 {
+                    log::warn!(
+                        "Body stream for {} from {} stalled for >{:?} after {} attempts.  This may indicate that cloud storage is overloaded, the response body is hung, or the request payload is unexpectedly large.",
+                        desc(),
+                        get_request.path(),
+                        STREAM_BODY_TIMEOUT,
+                        download_retry_count,
+                    );
+                    return Err(object_store::Error::Generic {
+                        store: "lance_io",
+                        source: format!(
+                            "body stream for {} stalled for >{:?}",
+                            desc(),
+                            STREAM_BODY_TIMEOUT,
+                        )
+                        .into(),
+                    });
+                }
+                log::warn!(
+                    "Body stream for {} from {} stalled for >{:?}; retrying (remaining retries: {})",
+                    desc(),
+                    get_request.path(),
+                    STREAM_BODY_TIMEOUT,
+                    retries,
                 );
                 retries -= 1;
             }
