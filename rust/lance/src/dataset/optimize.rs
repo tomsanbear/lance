@@ -209,13 +209,17 @@ pub struct CompactionOptions {
     /// fragments at a time).
     /// Defaults to `None` (no limit, all eligible fragments are compacted).
     pub max_source_fragments: Option<usize>,
-    /// Transaction properties to store with this commit.
-    ///
     /// These key-value pairs are stored in the transaction file
     /// and can be read later to identify the source of the commit
     /// (e.g., job_id for tracking completed compaction jobs).
     #[serde(skip)]
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
+    /// Per-scanner io_buffer_size for the compaction read pipeline. When `Some`,
+    /// applied via [`crate::dataset::Scanner::io_buffer_size`] before the
+    /// compaction reader is built — bounds in-flight bytes per scanner instead
+    /// of the global `DEFAULT_IO_BUFFER_SIZE_VALUE` (2 GiB). `None` (the
+    /// default) preserves Lance's scheduler default.
+    pub io_buffer_size_bytes: Option<u64>,
 }
 
 #[allow(deprecated)]
@@ -237,6 +241,7 @@ impl Default for CompactionOptions {
             binary_copy_read_batch_bytes: Some(16 * 1024 * 1024),
             max_source_fragments: None,
             transaction_properties: None,
+            io_buffer_size_bytes: None,
         }
     }
 }
@@ -260,6 +265,7 @@ impl CompactionOptions {
     /// - `lance.compaction.compaction_mode`
     /// - `lance.compaction.binary_copy_read_batch_bytes`
     /// - `lance.compaction.max_source_fragments`
+    /// - `lance.compaction.io_buffer_size_bytes`
     pub fn from_dataset_config(config: &HashMap<String, String>) -> Result<Self> {
         let mut opts = Self::default();
         opts.apply_dataset_config(config)?;
@@ -353,6 +359,14 @@ impl CompactionOptions {
                 }
                 "max_source_fragments" => {
                     self.max_source_fragments = Some(value.parse().map_err(|_| {
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}' (expected a non-negative integer)",
+                            key, value
+                        ))
+                    })?);
+                }
+                "io_buffer_size_bytes" => {
+                    self.io_buffer_size_bytes = Some(value.parse().map_err(|_| {
                         Error::invalid_input(format!(
                             "Invalid value for {}: '{}' (expected a non-negative integer)",
                             key, value
@@ -881,6 +895,7 @@ async fn prepare_reader(
     dataset: &Dataset,
     fragments: &[Fragment],
     batch_size: Option<usize>,
+    io_buffer_size_bytes: Option<u64>,
     with_frags: bool,
     capture_row_ids: bool,
 ) -> Result<(
@@ -897,6 +912,9 @@ async fn prepare_reader(
     }
     if let Some(bs) = batch_size {
         scanner.batch_size(bs);
+    }
+    if let Some(io_buf) = io_buffer_size_bytes {
+        scanner.io_buffer_size(io_buf);
     }
     if with_frags {
         scanner
@@ -1178,6 +1196,7 @@ async fn rewrite_files(
             dataset.as_ref(),
             &fragments,
             options.batch_size,
+            options.io_buffer_size_bytes,
             true,
             needs_remapping,
         )
