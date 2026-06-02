@@ -132,6 +132,18 @@ const UNVERIFIED_THRESHOLD_DAYS: i64 = 7;
 const S3_DELETE_STREAM_BATCH_SIZE: u64 = 1_000;
 const AZURE_DELETE_STREAM_BATCH_SIZE: u64 = 256;
 
+/// Concurrency for the manifest inspection pass in [`CleanupTask::process_manifests`].
+///
+/// Each in-flight slot holds a fully-parsed `Manifest`, which includes
+/// `Arc<Vec<Fragment>>`; for datasets in the tens-of-thousands-of-fragments
+/// range that's ~9-10 MiB per slot. The previous default of
+/// `object_store.io_parallelism()` is 64 on cloud stores, yielding ~600 MiB
+/// peak memory during cleanup — large enough that the auto-cleanup-on-commit
+/// path combined with concurrent reads contributed to RSS pressure observed on
+/// `catalyzed-worker`. 8 slots cap the peak at ~76 MiB while keeping the pass
+/// well within the IO bandwidth available to a maintenance task.
+const PROCESS_MANIFESTS_CONCURRENCY: usize = 8;
+
 impl<'a> CleanupTask<'a> {
     fn new(dataset: &'a Dataset, policy: CleanupPolicy) -> Self {
         Self { dataset, policy }
@@ -203,7 +215,7 @@ impl<'a> CleanupTask<'a> {
         self.dataset
             .commit_handler
             .list_manifest_locations(&self.dataset.base, &self.dataset.object_store, false)
-            .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
+            .try_for_each_concurrent(PROCESS_MANIFESTS_CONCURRENCY, |location| {
                 self.process_manifest_file(location, &inspection, tagged_versions)
             })
             .await?;
@@ -772,7 +784,7 @@ impl<'a> CleanupTask<'a> {
             self.dataset
                 .commit_handler
                 .list_manifest_locations(&branch_location.path, &self.dataset.object_store, false)
-                .try_for_each_concurrent(self.dataset.object_store.io_parallelism(), |location| {
+                .try_for_each_concurrent(PROCESS_MANIFESTS_CONCURRENCY, |location| {
                     self.process_branch_referenced_manifests(
                         location,
                         *root_version_number,
