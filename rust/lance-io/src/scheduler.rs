@@ -33,6 +33,13 @@ const BACKPRESSURE_DEBOUNCE: u64 = 60;
 static IOPS_COUNTER: AtomicU64 = AtomicU64::new(0);
 // Global counter of how many bytes were read by the scheduler
 static BYTES_READ_COUNTER: AtomicU64 = AtomicU64::new(0);
+// Live counters tracking how many MutableBatch / IoTask objects are
+// currently in flight. Used by the io_leak_repro example binary and
+// any future leak-class debugging. Cheap to maintain (one atomic
+// increment/decrement per batch/task) and pub so external binaries
+// can sample without going through tracing.
+pub static ACTIVE_BATCHES: AtomicU64 = AtomicU64::new(0);
+pub static ACTIVE_IO_TASKS: AtomicU64 = AtomicU64::new(0);
 
 pub fn iops_counter() -> u64 {
     IOPS_COUNTER.load(Ordering::Acquire)
@@ -278,6 +285,7 @@ impl<F: FnOnce(Response) + Send> MutableBatch<F> {
         num_reqs: usize,
         bypass_backpressure: bool,
     ) -> Self {
+        ACTIVE_BATCHES.fetch_add(1, Ordering::Release);
         Self {
             when_done: Some(when_done),
             data_buffers: vec![Bytes::default(); num_data_buffers as usize],
@@ -296,6 +304,7 @@ impl<F: FnOnce(Response) + Send> MutableBatch<F> {
 // data.
 impl<F: FnOnce(Response) + Send> Drop for MutableBatch<F> {
     fn drop(&mut self) {
+        ACTIVE_BATCHES.fetch_sub(1, Ordering::Release);
         // If we have an error, return that.  Otherwise return the data
         let result = if self.err.is_some() {
             Err(Error::wrapped(self.err.take().unwrap()))
@@ -390,6 +399,7 @@ impl IoTask {
     }
 
     async fn run(self) {
+        ACTIVE_IO_TASKS.fetch_add(1, Ordering::Release);
         let file_path = self.reader.path().as_ref();
         let num_bytes = self.num_bytes();
         let bytes = if self.to_read.start == self.to_read.end {
@@ -416,6 +426,7 @@ impl IoTask {
             range_end = self.to_read.end,
             "File I/O completed"
         );
+        ACTIVE_IO_TASKS.fetch_sub(1, Ordering::Release);
         (self.when_done)(bytes);
     }
 }
