@@ -213,8 +213,51 @@
 //!    relation to the way the data is stored.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Once, OnceLock};
 use std::{ops::Range, sync::Arc};
+
+/// Total `DecoderMessage`s currently parked in all live per-scan
+/// unbounded mpsc channels between `DecodeBatchScheduler` and
+/// `BatchDecodeStream` / `BatchDecodeIterator`. Read-only observability
+/// counter for memory-leak diagnostics — incremented on each successful
+/// `sink.send` (decoder.rs ~1261) and decremented on each `recv() ->
+/// Some` (decoder.rs ~1395, ~1741). The value × per-message payload
+/// approximates the bytes pinned in oneshot buffers behind unawaited
+/// `UnloadedPageShard` futures sitting in the channel.
+pub static QUEUED_DECODER_MESSAGES: AtomicU64 = AtomicU64::new(0);
+
+/// Count of live `schedule_and_decode` channels (the unbounded mpsc
+/// between scheduler and decoder, one per active scan). Incremented in
+/// `ActiveDecodeChannelGuard::new` immediately after each
+/// `mpsc::unbounded_channel()` site (decoder.rs ~2002, ~2131) and
+/// decremented when the guard drops with its hosting task/frame.
+pub static ACTIVE_DECODE_CHANNELS: AtomicU64 = AtomicU64::new(0);
+
+/// RAII increment of [`ACTIVE_DECODE_CHANNELS`]. Move into the producer
+/// task (or local frame for the blocking decode path) so the counter
+/// decrements naturally when that scope ends.
+pub struct ActiveDecodeChannelGuard;
+
+impl ActiveDecodeChannelGuard {
+    #[must_use]
+    pub fn new() -> Self {
+        ACTIVE_DECODE_CHANNELS.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Default for ActiveDecodeChannelGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for ActiveDecodeChannelGuard {
+    fn drop(&mut self) {
+        ACTIVE_DECODE_CHANNELS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 use arrow_array::cast::AsArray;
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchIterator, RecordBatchReader};
@@ -1259,7 +1302,10 @@ impl DecodeBatchScheduler {
             scheduler,
             |msg| {
                 match sink.send(msg) {
-                    Ok(_) => true,
+                    Ok(_) => {
+                        QUEUED_DECODER_MESSAGES.fetch_add(1, Ordering::Relaxed);
+                        true
+                    }
                     Err(SendError { .. }) => {
                         // The receiver has gone away.  We can't do anything about it
                         // so just ignore the error.
@@ -1393,6 +1439,9 @@ impl BatchDecodeStream {
         }
         while self.rows_scheduled < scheduled_need {
             let next_message = self.context.source.recv().await;
+            if next_message.is_some() {
+                QUEUED_DECODER_MESSAGES.fetch_sub(1, Ordering::Relaxed);
+            }
             match next_message {
                 Some(scan_line) => {
                     let scan_line = scan_line?;
@@ -1739,6 +1788,9 @@ impl StructuralBatchDecodeStream {
         }
         while self.rows_scheduled < scheduled_need {
             let next_message = self.context.source.recv().await;
+            if next_message.is_some() {
+                QUEUED_DECODER_MESSAGES.fetch_sub(1, Ordering::Relaxed);
+            }
             match next_message {
                 Some(scan_line) => {
                     let scan_line = scan_line?;
@@ -2000,6 +2052,7 @@ fn create_scheduler_decoder(
     };
 
     let (tx, rx) = mpsc::unbounded_channel();
+    let channel_guard = ActiveDecodeChannelGuard::new();
 
     let decode_stream = create_decode_stream(
         &target_schema,
@@ -2012,6 +2065,9 @@ fn create_scheduler_decoder(
     )?;
 
     let scheduler_handle = tokio::task::spawn(async move {
+        // Move the channel guard into the producer task; it drops with
+        // the task and decrements ACTIVE_DECODE_CHANNELS.
+        let _channel_guard = channel_guard;
         let mut decode_scheduler = match DecodeBatchScheduler::try_new(
             target_schema.as_ref(),
             &column_indices,
@@ -2129,6 +2185,9 @@ pub fn schedule_and_decode_blocking(
     let is_structural = column_infos[0].is_structural();
 
     let (tx, mut rx) = mpsc::unbounded_channel();
+    // Held on the local frame; drops when this synchronous decode
+    // function returns, decrementing ACTIVE_DECODE_CHANNELS.
+    let _channel_guard = ActiveDecodeChannelGuard::new();
 
     // Initialize the scheduler.  This is still "asynchronous" but we run it with a current-thread
     // runtime.
@@ -2163,6 +2222,9 @@ pub fn schedule_and_decode_blocking(
         .unwrap()
         != 0
     {}
+    // `recv_many` bypasses the per-`recv()` decrement at decoder.rs ~1395/~1741,
+    // so balance the channel queue counter by the count we just drained.
+    QUEUED_DECODER_MESSAGES.fetch_sub(messages.len() as u64, Ordering::Relaxed);
 
     // Create a decoder to decode the messages
     let decode_iterator = create_decode_iterator(
