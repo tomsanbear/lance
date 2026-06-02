@@ -1949,9 +1949,21 @@ fn check_scheduler_on_drop(
     stream: BoxStream<'static, ReadBatchTask>,
     scheduler_handle: tokio::task::JoinHandle<()>,
 ) -> BoxStream<'static, ReadBatchTask> {
-    // This is a bit weird but we create an "empty stream" that unwraps the scheduler handle (which
-    // will panic if the scheduler panicked).  This let's us check if the scheduler panicked
-    // when the stream finishes.
+    // The chain+unfold below preserves the prior behavior of awaiting the
+    // scheduler handle on graceful completion so a scheduler panic surfaces to
+    // the consumer via `unwrap`. It only runs if the consumer drains the inner
+    // stream to its end — early-drop paths (DataFusion error returns,
+    // MergeInsert OCC retries, cancellation) skip it entirely. Without an
+    // additional abort, the scheduler task keeps running on the runtime and
+    // its allocated `Bytes` accumulate in the unbounded mpsc channel for the
+    // lifetime of the process; we observe this as monotonic
+    // `QUEUED_DECODER_MESSAGES` growth under those workloads.
+    //
+    // The `StreamWithSchedulerAbort` wrapper holds the scheduler's
+    // `AbortHandle` and calls `abort()` from `Drop`, which fires on every
+    // termination path. `abort()` is idempotent and a no-op once the task has
+    // finished naturally, so the two mechanisms compose cleanly.
+    let abort_handle = scheduler_handle.abort_handle();
     let mut scheduler_handle = Some(scheduler_handle);
     let check_scheduler = stream::unfold((), move |_| {
         let handle = scheduler_handle.take();
@@ -1962,7 +1974,41 @@ fn check_scheduler_on_drop(
             None
         }
     });
-    stream.chain(check_scheduler).boxed()
+    let chained = stream.chain(check_scheduler).boxed();
+    StreamWithSchedulerAbort {
+        inner: chained,
+        abort_handle: Some(abort_handle),
+    }
+    .boxed()
+}
+
+/// Stream wrapper that aborts a scheduler [`tokio::task::JoinHandle`] when
+/// dropped. `abort()` is idempotent — calling it after the task has finished
+/// naturally is a no-op — so this stays correct whether the consumer drains
+/// the stream gracefully or drops it early.
+struct StreamWithSchedulerAbort {
+    inner: BoxStream<'static, ReadBatchTask>,
+    abort_handle: Option<tokio::task::AbortHandle>,
+}
+
+impl futures::Stream for StreamWithSchedulerAbort {
+    type Item = ReadBatchTask;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        this.inner.as_mut().poll_next(cx)
+    }
+}
+
+impl Drop for StreamWithSchedulerAbort {
+    fn drop(&mut self) {
+        if let Some(abort) = self.abort_handle.take() {
+            abort.abort();
+        }
+    }
 }
 
 pub fn create_decode_stream(
