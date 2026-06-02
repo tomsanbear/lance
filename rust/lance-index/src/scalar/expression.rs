@@ -15,7 +15,7 @@ use tokio::try_join;
 
 use super::{
     AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
-    SearchResult, TextQuery, TokenQuery,
+    SearchResult, TextQuery, TokenQuery, compound::CompoundSargableQuery,
 };
 #[cfg(feature = "geo")]
 use super::{GeoQuery, RelationQuery};
@@ -1062,7 +1062,7 @@ impl IndexedExpression {
     }
 
     /// Create an expression that is only an index query
-    fn index_query(
+    pub fn index_query(
         column: String,
         index_name: String,
         index_type: String,
@@ -1081,7 +1081,7 @@ impl IndexedExpression {
     }
 
     /// Create an expression that is only an index query with explicit needs_recheck
-    fn index_query_with_recheck(
+    pub fn index_query_with_recheck(
         column: String,
         index_name: String,
         index_type: String,
@@ -1425,6 +1425,26 @@ fn extract_nested_column_path(expr: &Expr) -> Option<String> {
     Some(lance_core::datatypes::format_field_path(&field_refs))
 }
 
+/// Check if a column participates as the first column in a compound index.
+///
+/// This is used as a fallback when no single-column index exists for the column.
+/// Returns the column name, data type, and query parser if a compound index covers
+/// this column as its first (prefix) column.
+fn compound_fallback_for_column<'b>(
+    col_name: &str,
+    expr: &Expr,
+    index_info: &'b dyn IndexInformationProvider,
+) -> Option<(String, DataType, &'b dyn ScalarQueryParser)> {
+    let compound_info = index_info.get_compound_index(&[col_name])?;
+    if !compound_info.columns.is_empty() && compound_info.columns[0] == col_name {
+        let data_type = compound_info.data_types[0].clone();
+        if let Some(data_type) = compound_info.parser.is_valid_reference(expr, &data_type) {
+            return Some((col_name.to_string(), data_type, compound_info.parser));
+        }
+    }
+    None
+}
+
 // Extract a column from the expression, if it is a column, and we have an index for that column, or None
 //
 // There's two ways to get a column.  First, the obvious way, is a
@@ -1445,13 +1465,13 @@ fn maybe_indexed_column<'b>(
 
     match expr {
         Expr::Column(col) => {
-            let col = col.name.as_str();
-            let (data_type, parser) = index_info.get_index(col)?;
-            if let Some(data_type) = parser.is_valid_reference(expr, data_type) {
-                Some((col.to_string(), data_type, parser))
-            } else {
-                None
+            let col_name = col.name.as_str();
+            if let Some((data_type, parser)) = index_info.get_index(col_name) {
+                if let Some(data_type) = parser.is_valid_reference(expr, data_type) {
+                    return Some((col_name.to_string(), data_type, parser));
+                }
             }
+            compound_fallback_for_column(col_name, expr, index_info)
         }
         Expr::ScalarFunction(udf) => {
             if udf.args.is_empty() {
@@ -1459,12 +1479,12 @@ fn maybe_indexed_column<'b>(
             }
             // For non-get_field functions, fall back to old behavior
             let col = maybe_column(&udf.args[0])?;
-            let (data_type, parser) = index_info.get_index(col)?;
-            if let Some(data_type) = parser.is_valid_reference(expr, data_type) {
-                Some((col.to_string(), data_type, parser))
-            } else {
-                None
+            if let Some((data_type, parser)) = index_info.get_index(col) {
+                if let Some(data_type) = parser.is_valid_reference(expr, data_type) {
+                    return Some((col.to_string(), data_type, parser));
+                }
             }
+            compound_fallback_for_column(col, expr, index_info)
         }
         _ => None,
     }
@@ -1690,11 +1710,285 @@ fn maybe_range(
     parser.visit_between(&left_col, &low, &high)
 }
 
+/// Recursively collect equality predicates from an AND expression tree.
+fn collect_equality_predicates(expr: &Expr) -> Vec<(String, ScalarValue)> {
+    match expr {
+        Expr::BinaryExpr(binary) => match binary.op {
+            Operator::And => {
+                let mut predicates = collect_equality_predicates(&binary.left);
+                predicates.extend(collect_equality_predicates(&binary.right));
+                predicates
+            }
+            Operator::Eq => {
+                if let Some(col) = maybe_column(&binary.left) {
+                    if let Expr::Literal(value, _) = binary.right.as_ref() {
+                        return vec![(col.to_string(), value.clone())];
+                    }
+                }
+                if let Some(col) = maybe_column(&binary.right) {
+                    if let Expr::Literal(value, _) = binary.left.as_ref() {
+                        return vec![(col.to_string(), value.clone())];
+                    }
+                }
+                vec![]
+            }
+            _ => vec![],
+        },
+        _ => vec![],
+    }
+}
+
+/// A range predicate extracted from an expression.
+#[derive(Debug, Clone)]
+struct RangePredicate {
+    column: String,
+    lower: Bound<ScalarValue>,
+    upper: Bound<ScalarValue>,
+}
+
+/// Recursively collect range predicates from an AND expression tree.
+fn collect_range_predicates(expr: &Expr) -> Vec<RangePredicate> {
+    match expr {
+        Expr::BinaryExpr(binary) => match binary.op {
+            Operator::And => {
+                let mut predicates = collect_range_predicates(&binary.left);
+                predicates.extend(collect_range_predicates(&binary.right));
+                merge_range_predicates(predicates)
+            }
+            Operator::Gt | Operator::GtEq | Operator::Lt | Operator::LtEq => {
+                if let Some(col) = maybe_column(&binary.left) {
+                    if let Expr::Literal(value, _) = binary.right.as_ref() {
+                        let (lower, upper) = match binary.op {
+                            Operator::Gt => (Bound::Excluded(value.clone()), Bound::Unbounded),
+                            Operator::GtEq => (Bound::Included(value.clone()), Bound::Unbounded),
+                            Operator::Lt => (Bound::Unbounded, Bound::Excluded(value.clone())),
+                            Operator::LtEq => (Bound::Unbounded, Bound::Included(value.clone())),
+                            _ => unreachable!(),
+                        };
+                        return vec![RangePredicate {
+                            column: col.to_string(),
+                            lower,
+                            upper,
+                        }];
+                    }
+                }
+                if let Some(col) = maybe_column(&binary.right) {
+                    if let Expr::Literal(value, _) = binary.left.as_ref() {
+                        let (lower, upper) = match binary.op {
+                            Operator::Gt => (Bound::Unbounded, Bound::Excluded(value.clone())),
+                            Operator::GtEq => (Bound::Unbounded, Bound::Included(value.clone())),
+                            Operator::Lt => (Bound::Excluded(value.clone()), Bound::Unbounded),
+                            Operator::LtEq => (Bound::Included(value.clone()), Bound::Unbounded),
+                            _ => unreachable!(),
+                        };
+                        return vec![RangePredicate {
+                            column: col.to_string(),
+                            lower,
+                            upper,
+                        }];
+                    }
+                }
+                vec![]
+            }
+            _ => vec![],
+        },
+        Expr::Between(between) => {
+            if let Some(col) = maybe_column(&between.expr) {
+                if let (Expr::Literal(low, _), Expr::Literal(high, _)) =
+                    (between.low.as_ref(), between.high.as_ref())
+                {
+                    if between.negated {
+                        return vec![];
+                    }
+                    return vec![RangePredicate {
+                        column: col.to_string(),
+                        lower: Bound::Included(low.clone()),
+                        upper: Bound::Included(high.clone()),
+                    }];
+                }
+            }
+            vec![]
+        }
+        _ => vec![],
+    }
+}
+
+/// Merge multiple range predicates on the same column into a single predicate.
+fn merge_range_predicates(predicates: Vec<RangePredicate>) -> Vec<RangePredicate> {
+    use std::collections::HashMap;
+    let mut by_column: HashMap<String, RangePredicate> = HashMap::new();
+    for pred in predicates {
+        if let Some(existing) = by_column.get_mut(&pred.column) {
+            if !matches!(pred.lower, Bound::Unbounded) {
+                existing.lower = pred.lower;
+            }
+            if !matches!(pred.upper, Bound::Unbounded) {
+                existing.upper = pred.upper;
+            }
+        } else {
+            by_column.insert(pred.column.clone(), pred);
+        }
+    }
+    by_column.into_values().collect()
+}
+
+/// An IN-list predicate extracted from an expression.
+#[derive(Debug, Clone)]
+struct InListPredicate {
+    column: String,
+    values: Vec<ScalarValue>,
+}
+
+/// Recursively collect IN-list predicates from an AND expression tree.
+fn collect_in_list_predicates(expr: &Expr) -> Vec<InListPredicate> {
+    match expr {
+        Expr::BinaryExpr(binary) => match binary.op {
+            Operator::And => {
+                let mut predicates = collect_in_list_predicates(&binary.left);
+                predicates.extend(collect_in_list_predicates(&binary.right));
+                predicates
+            }
+            _ => vec![],
+        },
+        Expr::InList(in_list) => {
+            if in_list.negated {
+                return vec![];
+            }
+            if let Some(col) = maybe_column(&in_list.expr) {
+                let values: Vec<ScalarValue> = in_list
+                    .list
+                    .iter()
+                    .filter_map(|e| {
+                        if let Expr::Literal(val, _) = e {
+                            if !val.is_null() {
+                                return Some(val.clone());
+                            }
+                        }
+                        None
+                    })
+                    .collect();
+                if !values.is_empty() {
+                    return vec![InListPredicate {
+                        column: col.to_string(),
+                        values,
+                    }];
+                }
+            }
+            vec![]
+        }
+        _ => vec![],
+    }
+}
+
+/// An IS NULL predicate extracted from an expression.
+#[derive(Debug, Clone)]
+struct IsNullPredicate {
+    column: String,
+}
+
+/// Recursively collect IS NULL predicates from an AND expression tree.
+fn collect_is_null_predicates(expr: &Expr) -> Vec<IsNullPredicate> {
+    match expr {
+        Expr::BinaryExpr(binary) => match binary.op {
+            Operator::And => {
+                let mut predicates = collect_is_null_predicates(&binary.left);
+                predicates.extend(collect_is_null_predicates(&binary.right));
+                predicates
+            }
+            _ => vec![],
+        },
+        Expr::IsNull(inner) => {
+            if let Some(col) = maybe_column(inner) {
+                return vec![IsNullPredicate {
+                    column: col.to_string(),
+                }];
+            }
+            vec![]
+        }
+        _ => vec![],
+    }
+}
+
+/// Check if an AND expression can be satisfied by a compound index prefix lookup.
+fn maybe_compound_prefix(
+    expr: &BinaryExpr,
+    index_info: &dyn IndexInformationProvider,
+) -> Option<IndexedExpression> {
+    let full_expr = Expr::BinaryExpr(expr.clone());
+    let equality_predicates = collect_equality_predicates(&full_expr);
+    if equality_predicates.is_empty() {
+        return None;
+    }
+
+    let eq_cols: Vec<&str> = equality_predicates.iter().map(|(c, _)| c.as_str()).collect();
+    let compound_info = index_info.get_compound_index(&eq_cols)?;
+
+    // Build prefix values in index column order
+    let mut prefix_values = Vec::with_capacity(eq_cols.len());
+    let mut prefix_col_count = 0;
+    for col_name in compound_info.columns.iter() {
+        if let Some((_, val)) = equality_predicates.iter().find(|(c, _)| c == col_name) {
+            prefix_values.push(val.clone());
+            prefix_col_count += 1;
+        } else {
+            break;
+        }
+    }
+
+    if prefix_values.is_empty() {
+        return None;
+    }
+
+    // Check predicate on NEXT column after the equality prefix.
+    let query = if prefix_col_count < compound_info.columns.len() {
+        let next_col = &compound_info.columns[prefix_col_count];
+
+        let range_predicates = collect_range_predicates(&full_expr);
+        let range_on_next = range_predicates
+            .iter()
+            .find(|rp| &rp.column == next_col)
+            .map(|rp| (rp.lower.clone(), rp.upper.clone()));
+
+        if let Some(range) = range_on_next {
+            CompoundSargableQuery::prefix_lookup_with_range(prefix_values, range)
+        } else {
+            let in_list_predicates = collect_in_list_predicates(&full_expr);
+            let in_list_on_next = in_list_predicates.iter().find(|ip| &ip.column == next_col);
+
+            if let Some(in_pred) = in_list_on_next {
+                CompoundSargableQuery::prefix_in(prefix_values, in_pred.values.clone())
+            } else {
+                let is_null_predicates = collect_is_null_predicates(&full_expr);
+                let is_null_on_next = is_null_predicates.iter().any(|np| &np.column == next_col);
+                if is_null_on_next {
+                    CompoundSargableQuery::prefix_is_null(prefix_values, 0)
+                } else {
+                    CompoundSargableQuery::prefix_lookup(prefix_values)
+                }
+            }
+        }
+    } else {
+        CompoundSargableQuery::prefix_lookup(prefix_values)
+    };
+
+    Some(IndexedExpression::index_query(
+        compound_info.columns[0].clone(),
+        compound_info.index_name.to_string(),
+        "compoundbtree".to_string(),
+        Arc::new(query),
+    ))
+}
+
 fn visit_and(
     expr: &BinaryExpr,
     index_info: &dyn IndexInformationProvider,
     depth: usize,
 ) -> Result<Option<IndexedExpression>> {
+    // Check for compound index prefix pattern first
+    if let Some(compound_expr) = maybe_compound_prefix(expr, index_info) {
+        return Ok(Some(compound_expr));
+    }
+
     // Many scalar indices can efficiently handle a BETWEEN query as a single search and this
     // can be much more efficient than two separate range queries.  As an optimization we check
     // to see if this is a between query and, if so, we handle it as a single query
@@ -1819,6 +2113,29 @@ pub trait IndexInformationProvider {
     /// Check if an index exists for `col` and, if so, return the data type of col
     /// as well as a query parser that can parse queries for that column
     fn get_index(&self, col: &str) -> Option<(&DataType, &dyn ScalarQueryParser)>;
+
+    /// Check if a compound index exists for the given columns.
+    ///
+    /// Returns the index name, column data types, and a query parser if a compound
+    /// index exists that covers all the specified columns (in order).
+    ///
+    /// Default implementation returns None (no compound index support).
+    fn get_compound_index(&self, _cols: &[&str]) -> Option<CompoundIndexInfo<'_>> {
+        None
+    }
+}
+
+/// Information about a compound index.
+#[derive(Debug)]
+pub struct CompoundIndexInfo<'a> {
+    /// Index name.
+    pub index_name: &'a str,
+    /// Column names in index order.
+    pub columns: &'a [String],
+    /// Column data types in index order.
+    pub data_types: &'a [DataType],
+    /// Query parser for the compound index.
+    pub parser: &'a dyn ScalarQueryParser,
 }
 
 /// Attempt to split a filter expression into a search of scalar indexes and an

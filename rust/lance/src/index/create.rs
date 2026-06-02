@@ -11,7 +11,7 @@ use crate::{
         DatasetIndexExt, DatasetIndexInternalExt,
         api::{IndexSegment, IndexSegmentPlan},
         build_index_metadata_from_segments,
-        scalar::build_scalar_index,
+        scalar::{build_compound_btree_index, build_scalar_index},
         vector::{
             LANCE_VECTOR_INDEX, VectorIndexParams, build_distributed_vector_index,
             build_empty_vector_index, build_vector_index,
@@ -47,6 +47,74 @@ fn default_index_name(fields: &[&str]) -> String {
     } else {
         fields.join(".")
     }
+}
+
+/// Validate index columns and resolve them against the schema.
+///
+/// Returns the resolved fields, corrected column names (with proper casing), and field IDs.
+/// Supports 1-8 columns for compound indices.
+fn validate_index_columns(
+    schema: &lance_core::datatypes::Schema,
+    columns: &[String],
+) -> Result<(Vec<lance_core::datatypes::Field>, Vec<String>, Vec<i32>)> {
+    if columns.is_empty() {
+        return Err(Error::index(
+            "Index must have at least one column".to_string(),
+        ));
+    }
+    if columns.len() > 8 {
+        return Err(Error::index(format!(
+            "Compound index exceeds maximum of 8 columns (got {})",
+            columns.len()
+        )));
+    }
+
+    let mut fields = Vec::with_capacity(columns.len());
+    let mut corrected_columns = Vec::with_capacity(columns.len());
+
+    for column_input in columns {
+        let Some(field_path) = schema.resolve_case_insensitive(column_input) else {
+            return Err(Error::index(format!(
+                "CreateIndex: column '{}' does not exist",
+                column_input
+            )));
+        };
+        let field = *field_path.last().unwrap();
+        fields.push(field.clone());
+
+        let names: Vec<&str> = field_path.iter().map(|f| f.name.as_str()).collect();
+        corrected_columns.push(format_field_path(&names));
+    }
+
+    let field_ids: Vec<i32> = fields.iter().map(|f| f.id).collect();
+    Ok((fields, corrected_columns, field_ids))
+}
+
+/// Generate a default index name with collision handling.
+///
+/// Uses the user-supplied column names (from `columns`) to build the base name so
+/// the generated index name preserves whatever characters the caller passed.
+fn generate_index_name(
+    columns: &[String],
+    field_ids: &[i32],
+    indices: &[IndexMetadata],
+) -> String {
+    let column_path = if columns.len() == 1 {
+        default_index_name(&[columns[0].as_str()])
+    } else {
+        columns.join("_")
+    };
+    let base_name = format!("{column_path}_idx");
+    let mut candidate = base_name.clone();
+    let mut counter = 2;
+    while indices
+        .iter()
+        .any(|idx| idx.name == candidate && idx.fields != field_ids)
+    {
+        candidate = format!("{base_name}_{counter}");
+        counter += 1;
+    }
+    candidate
 }
 
 pub struct CreateIndexBuilder<'a> {
@@ -153,25 +221,12 @@ impl<'a> CreateIndexBuilder<'a> {
 
     #[instrument(skip_all)]
     pub async fn execute_uncommitted(&mut self) -> Result<IndexMetadata> {
-        if self.columns.len() != 1 {
-            return Err(Error::index(
-                "Only support building index on 1 column at the moment".to_string(),
-            ));
-        }
-        let column_input = &self.columns[0];
-        // Use case-insensitive lookup for both simple and nested paths.
-        // resolve_case_insensitive tries exact match first, then falls back to case-insensitive.
-        let Some(field_path) = self.dataset.schema().resolve_case_insensitive(column_input) else {
-            return Err(Error::index(format!(
-                "CreateIndex: column '{column_input}' does not exist"
-            )));
-        };
-        let field = *field_path.last().unwrap();
-        // Reconstruct the column path with correct case from schema
-        // Use quoted format for SQL parsing (special chars are quoted)
-        let names: Vec<&str> = field_path.iter().map(|f| f.name.as_str()).collect();
-        let quoted_column: String = format_field_path(&names);
-        let column = quoted_column.as_str();
+        let (fields, corrected_columns, field_ids) =
+            validate_index_columns(self.dataset.schema(), &self.columns)?;
+
+        let column = corrected_columns[0].as_str();
+        #[allow(unused_variables)]
+        let field = &fields[0];
 
         // If train is true but dataset is empty, automatically set train to false
         let train = if self.train {
@@ -186,23 +241,11 @@ impl<'a> CreateIndexBuilder<'a> {
             .dataset
             .open_frag_reuse_index(&NoOpMetricsCollector)
             .await?;
+
         let index_name = if let Some(name) = self.name.take() {
             name
         } else {
-            // Generate default name with collision handling
-            let column_path = default_index_name(&names);
-            let base_name = format!("{column_path}_idx");
-            let mut candidate = base_name.clone();
-            let mut counter = 2; // Start with no suffix, then use _2, _3, ...
-            // Find unique name by appending numeric suffix if needed
-            while indices
-                .iter()
-                .any(|idx| idx.name == candidate && idx.fields != [field.id])
-            {
-                candidate = format!("{base_name}_{counter}");
-                counter += 1;
-            }
-            candidate
+            generate_index_name(&self.columns, &field_ids, &indices)
         };
         let existing_named_indices = indices
             .iter()
@@ -210,7 +253,7 @@ impl<'a> CreateIndexBuilder<'a> {
             .collect::<Vec<_>>();
         if existing_named_indices
             .iter()
-            .any(|idx| idx.fields != [field.id])
+            .any(|idx| idx.fields != field_ids)
         {
             return Err(Error::index(format!(
                 "Index name '{index_name}' already exists with different fields, \
@@ -230,7 +273,42 @@ impl<'a> CreateIndexBuilder<'a> {
             None => Uuid::new_v4(),
         };
         let mut output_index_uuid = index_id;
-        let created_index = match (self.index_type, self.params.index_name()) {
+
+        // Handle multi-column (compound) indices
+        let created_index = if self.columns.len() > 1 {
+            match (self.index_type, self.params.index_name()) {
+                (IndexType::Scalar | IndexType::BTree, LANCE_SCALAR_INDEX) => {
+                    let params = self
+                        .params
+                        .as_any()
+                        .downcast_ref::<ScalarIndexParams>()
+                        .cloned()
+                        .unwrap_or_else(|| ScalarIndexParams::new("compoundbtree".to_string()));
+
+                    build_compound_btree_index(
+                        self.dataset,
+                        &corrected_columns
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>(),
+                        &index_id.to_string(),
+                        &params,
+                        train,
+                        self.fragments.clone(),
+                        self.mem_pool_size,
+                    )
+                    .await?
+                }
+                (index_type, _) => {
+                    return Err(Error::index(format!(
+                        "Index type {:?} does not support multiple columns. \
+                         Use BTree or Scalar for compound indices.",
+                        index_type
+                    )));
+                }
+            }
+        } else {
+            match (self.index_type, self.params.index_name()) {
             (
                 IndexType::Bitmap
                 | IndexType::BTree
@@ -461,12 +539,13 @@ impl<'a> CreateIndexBuilder<'a> {
                     "Index type {index_type} with name {index_name} is not supported"
                 )));
             }
+            }
         };
 
         Ok(IndexMetadata {
             uuid: output_index_uuid,
             name: index_name,
-            fields: vec![field.id],
+            fields: field_ids,
             dataset_version: self.dataset.manifest.version,
             fragment_bitmap: if train {
                 match &self.fragments {

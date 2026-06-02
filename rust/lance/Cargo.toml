@@ -295,5 +295,9 @@ harness = false
 name = "concurrent_append"
 harness = false
 
+[[bench]]
+name = "compound_index_comparison"
+harness = false
+
 [lints]
 workspace = true

@@ -19,10 +19,12 @@ arrow-ord.workspace = true
 arrow-schema.workspace = true
 arrow-select.workspace = true
 arrow-arith.workspace = true
+arrow-row.workspace = true
 async-recursion.workspace = true
 async-trait.workspace = true
 bitvec.workspace = true
 datafusion-common.workspace = true
+datafusion-proto-common.workspace = true
 datafusion-expr.workspace = true
 datafusion-physical-expr.workspace = true
 datafusion.workspace = true
@@ -62,6 +64,7 @@ rayon.workspace = true
 serde_json.workspace = true
 serde.workspace = true
 smallvec = "1.15"
+snafu.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tempfile.workspace = true
@@ -83,6 +86,7 @@ env_logger = "0.11.6"
 geo-traits.workspace = true
 lance-datagen.workspace = true
 lance-testing.workspace = true
+proptest.workspace = true
 test-log.workspace = true
 rstest.workspace = true
 chrono.workspace = true
@@ -169,6 +173,10 @@ required-features = ["geo"]
 
 [[bench]]
 name = "residual_transform"
+harness = false
+
+[[bench]]
+name = "compound_btree"
 harness = false
 
 [lints]

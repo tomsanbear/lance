@@ -29,8 +29,9 @@ use lance_index::mem_wal::{MEM_WAL_INDEX_NAME, MemWalIndex};
 use lance_index::optimize::OptimizeOptions;
 use lance_index::pb::index::Implementation;
 pub use lance_index::progress::{IndexBuildProgress, NoopIndexBuildProgress};
+use lance_index::scalar::compound_btree::CompoundQueryParser;
 use lance_index::scalar::expression::{
-    IndexInformationProvider, MultiQueryParser, ScalarQueryParser,
+    CompoundIndexInfo, IndexInformationProvider, MultiQueryParser, ScalarQueryParser,
 };
 use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexPlugin};
 use lance_index::scalar::lance_format::LanceIndexStore;
@@ -427,10 +428,32 @@ pub(crate) async fn remap_index(
         .find(|i| i.uuid == *index_id)
         .ok_or_else(|| Error::index(format!("Index with id {} does not exist", index_id)))?;
 
+    // Handle multi-field (compound) indices
     if matched.fields.len() > 1 {
-        return Err(Error::index(
-            "Remapping indices with multiple fields is not supported".to_string(),
-        ));
+        // For compound indices, we need to use the remap capability via the scalar index trait
+        let first_field_id = matched.fields.first().expect("An index existed with no fields");
+        let first_field_path = dataset.schema().field_path(*first_field_id)?;
+
+        let new_id = Uuid::new_v4();
+        let new_store = LanceIndexStore::from_dataset_for_new(dataset, &new_id.to_string())?;
+
+        let scalar_index = dataset
+            .open_scalar_index(&first_field_path, &index_id.to_string(), &NoOpMetricsCollector)
+            .await?;
+
+        if !scalar_index.can_remap() {
+            return Ok(RemapResult::Drop);
+        }
+
+        let created_index = scalar_index.remap(row_id_map, &new_store).await?;
+
+        return Ok(RemapResult::Remapped(RemappedIndex {
+            old_id: *index_id,
+            new_id,
+            index_details: created_index.index_details,
+            index_version: created_index.index_version,
+            files: None,
+        }));
     }
 
     if row_id_map.values().all(|v| v.is_none()) {
@@ -570,9 +593,25 @@ pub(crate) async fn remap_index(
     }))
 }
 
+/// Entry for a compound index (multi-column).
+#[derive(Debug)]
+pub struct CompoundIndexEntry {
+    /// Index name.
+    pub index_name: String,
+    /// Column names in index order.
+    pub columns: Vec<String>,
+    /// Column data types in index order.
+    pub data_types: Vec<DataType>,
+    /// Query parser for this compound index.
+    pub parser: Arc<CompoundQueryParser>,
+}
+
 #[derive(Debug)]
 pub struct ScalarIndexInfo {
+    /// Single-column indices, keyed by column name.
     indexed_columns: HashMap<String, (DataType, Box<MultiQueryParser>)>,
+    /// Compound (multi-column) indices.
+    compound_indices: Vec<CompoundIndexEntry>,
 }
 
 impl IndexInformationProvider for ScalarIndexInfo {
@@ -580,6 +619,34 @@ impl IndexInformationProvider for ScalarIndexInfo {
         self.indexed_columns
             .get(col)
             .map(|(ty, parser)| (ty, parser.as_ref() as &dyn ScalarQueryParser))
+    }
+
+    fn get_compound_index(&self, cols: &[&str]) -> Option<CompoundIndexInfo<'_>> {
+        // Find a compound index where the requested columns form a prefix
+        for entry in &self.compound_indices {
+            if cols.len() <= entry.columns.len() {
+                // Check if cols match the first N columns of the index (order-independent matching)
+                let index_prefix: Vec<&str> = entry
+                    .columns
+                    .iter()
+                    .take(cols.len())
+                    .map(|s| s.as_str())
+                    .collect();
+
+                let all_match = cols.iter().all(|c| index_prefix.contains(c))
+                    && index_prefix.iter().all(|c| cols.contains(c));
+
+                if all_match {
+                    return Some(CompoundIndexInfo {
+                        index_name: &entry.index_name,
+                        columns: &entry.columns,
+                        data_types: &entry.data_types,
+                        parser: &*entry.parser,
+                    });
+                }
+            }
+        }
+        None
     }
 }
 
@@ -2168,28 +2235,81 @@ impl DatasetIndexInternalExt for Dataset {
         let indices = self.load_indices().await?;
         let schema = self.schema();
         let mut indexed_fields = Vec::new();
-        for index in indices.iter().filter(|idx| {
-            let idx_schema = schema.project_by_ids(idx.fields.as_slice(), true);
+        let mut compound_indices = Vec::new();
+
+        for index in indices.iter() {
+            let idx_schema = schema.project_by_ids(index.fields.as_slice(), true);
             let is_vector_index = idx_schema
                 .fields
                 .iter()
                 .any(|f| is_vector_field(f.data_type()));
 
+            if is_vector_index {
+                continue;
+            }
+
             // Check if this is an FTS index by looking at index details
-            let is_fts_index = if let Some(details) = &idx.index_details {
+            let is_fts_index = if let Some(details) = &index.index_details {
                 IndexDetails(details.clone()).supports_fts()
             } else {
                 false
             };
 
             // Only include indices with non-empty fragment bitmaps, except for FTS indices
-            // which need to be discoverable even when empty
-            let has_non_empty_bitmap = idx.fragment_bitmap.as_ref().is_some_and(|bitmap| {
+            let has_non_empty_bitmap = index.fragment_bitmap.as_ref().is_some_and(|bitmap| {
                 !bitmap.is_empty() && !(bitmap & self.fragment_bitmap.as_ref()).is_empty()
             });
 
-            idx.fields.len() == 1 && !is_vector_index && (has_non_empty_bitmap || is_fts_index)
-        }) {
+            if !has_non_empty_bitmap && !is_fts_index {
+                continue;
+            }
+
+            // Handle compound (multi-field) indices
+            if index.fields.len() > 1 {
+                let mut columns = Vec::with_capacity(index.fields.len());
+                let mut data_types = Vec::with_capacity(index.fields.len());
+
+                for field_id in &index.fields {
+                    let field = schema.field_by_id(*field_id).ok_or_else(|| {
+                        Error::internal(format!(
+                            "Index referenced a field with id {field_id} which did not exist in the schema"
+                        ))
+                    })?;
+
+                    let field_path = if let Some(ancestors) = schema.field_ancestry_by_id(field.id)
+                    {
+                        let field_refs: Vec<&str> =
+                            ancestors.iter().map(|f| f.name.as_str()).collect();
+                        lance_core::datatypes::format_field_path(&field_refs)
+                    } else {
+                        field.name.clone()
+                    };
+
+                    columns.push(field_path);
+                    data_types.push(field.data_type());
+                }
+
+                let parser = Arc::new(CompoundQueryParser::new(
+                    index.name.clone(),
+                    columns.clone(),
+                    data_types.clone(),
+                ));
+
+                compound_indices.push(CompoundIndexEntry {
+                    index_name: index.name.clone(),
+                    columns,
+                    data_types,
+                    parser,
+                });
+
+                continue;
+            }
+
+            if index.fields.is_empty() {
+                continue;
+            }
+
+            // Handle single-field indices (existing logic)
             let field = index.fields[0];
             let field = schema.field_by_id(field).ok_or_else(|| {
                 Error::internal(format!(
@@ -2197,7 +2317,6 @@ impl DatasetIndexInternalExt for Dataset {
                 ))
             })?;
 
-            // Build the full field path for nested fields
             let field_path = if let Some(ancestors) = schema.field_ancestry_by_id(field.id) {
                 let field_refs: Vec<&str> = ancestors.iter().map(|f| f.name.as_str()).collect();
                 lance_core::datatypes::format_field_path(&field_refs)
@@ -2229,18 +2348,15 @@ impl DatasetIndexInternalExt for Dataset {
                 indexed_fields.push((field_path, (field.data_type(), query_parser)));
             }
         }
+
         let mut index_info_map = HashMap::with_capacity(indexed_fields.len());
         for indexed_field in indexed_fields {
-            // Need to wrap in an option here because we know that only one of and_modify and or_insert will be called
-            // but the rust compiler does not.
             let mut parser = Some(indexed_field.1.1);
             let parser = &mut parser;
             index_info_map
                 .entry(indexed_field.0)
                 .and_modify(|existing: &mut (DataType, Box<MultiQueryParser>)| {
-                    // If there are two indices on the same column, they must have the same type
                     debug_assert_eq!(existing.0, indexed_field.1.0);
-
                     existing.1.add(parser.take().unwrap());
                 })
                 .or_insert_with(|| {
@@ -2250,8 +2366,10 @@ impl DatasetIndexInternalExt for Dataset {
                     )
                 });
         }
+
         Ok(ScalarIndexInfo {
             indexed_columns: index_info_map,
+            compound_indices,
         })
     }
 

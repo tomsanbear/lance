@@ -131,6 +131,7 @@ datafusion = { version = "53.0.0", default-features = false, features = [
     "unicode_expressions",
 ] }
 datafusion-common = "53.0.0"
+datafusion-proto-common = { version = "53.1.0", features = ["json"] }
 datafusion-functions = { version = "53.0.0", features = ["regex_expressions"] }
 datafusion-sql = "53.0.0"
 datafusion-expr = "53.0.0"
