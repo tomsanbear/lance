@@ -1,6 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+// Bump rustc's recursion / query-depth limit so `index/vector/builder.rs`'s
+// deep async generators don't trip the default-128 cap. Hit when building
+// downstream binaries (catalyzed-worker) with `--release` +
+// `CARGO_PROFILE_RELEASE_DEBUG=2` + `--features profiling` — `release`
+// monomorphises more aggressively, `debug=2` forces full DWARF computation
+// for those concrete types, and the profiling features pull in extra glue.
+// The default 128 was fine before this combination; 512 leaves ample
+// headroom without masking real recursion-explosion regressions.
+#![recursion_limit = "512"]
+
 //! Lance Columnar Data Format
 //!
 //! Lance columnar data format is an alternative to Parquet. It provides 100x faster for random access,
