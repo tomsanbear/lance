@@ -965,6 +965,25 @@ impl Dataset {
         &self.manifest_location
     }
 
+    /// Public accessor for the stable-row-id → row-address translation index.
+    ///
+    /// Returns `Ok(None)` when the dataset is in address-style row-id mode
+    /// (`manifest.uses_stable_row_ids() == false`); in that case row ids and
+    /// row addresses already coincide and no translation index is needed.
+    ///
+    /// Exposed for downstream consumers (catalyzed-lance) that need to do
+    /// their own stable-row-id → row-address translation for query planning
+    /// (e.g. fragment-level pruning from a scalar-index lookup result).
+    /// The internal `crate::dataset::rowids::get_row_id_index` is otherwise
+    /// gated behind a `pub(crate)` module declaration; this thin wrapper
+    /// keeps the visibility minimal — one additive method, no module
+    /// re-exports — so future syncs only have to preserve this line.
+    pub async fn row_id_index(
+        &self,
+    ) -> Result<Option<std::sync::Arc<lance_table::rowids::RowIdIndex>>> {
+        crate::dataset::rowids::get_row_id_index(self).await
+    }
+
     /// Create a [`delta::DatasetDeltaBuilder`] to explore changes between dataset versions.
     ///
     /// # Example
