@@ -41,6 +41,11 @@ use rand::{Rng, rng};
 
 use super::ObjectStore;
 use crate::Dataset;
+
+/// Maximum value, in milliseconds, that the auto-tuned `SlotBackoff::unit`
+/// is allowed to take after the first CAS conflict. See the call site for
+/// the rationale.
+const MAX_AUTO_TUNED_UNIT_MS: u32 = 500;
 use crate::dataset::cleanup::auto_cleanup_hook;
 use crate::dataset::fragment::FileFragment;
 use crate::dataset::transaction::{Operation, Transaction};
@@ -1105,7 +1110,17 @@ pub(crate) async fn commit_transaction(
                     // We pass the first attempt's time to the backoff so it's used
                     // as the unit for backoff time slots.
                     // See SlotBackoff implementation for more details on how this works.
-                    backoff = backoff.with_unit((start.elapsed().as_millis() * 11 / 10) as u32);
+                    //
+                    // The slot unit is capped at MAX_AUTO_TUNED_UNIT_MS so that a
+                    // slow first attempt (e.g. a heavily-versioned dataset where
+                    // the initial manifest read + write itself takes seconds)
+                    // does not compound via the exponential slot doubling into
+                    // 30+ second retry tails. The cap is roughly one S3
+                    // round-trip — short enough to bound the tail, long enough
+                    // that genuinely-contended writers can finish between
+                    // attempts.
+                    let auto_unit = (start.elapsed().as_millis() * 11 / 10) as u32;
+                    backoff = backoff.with_unit(auto_unit.min(MAX_AUTO_TUNED_UNIT_MS));
                 }
 
                 if next_attempt_i < num_attempts {
@@ -1168,6 +1183,32 @@ mod tests {
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+
+    #[test]
+    fn auto_tuned_backoff_unit_capped_at_max() {
+        // Pins the per-attempt slot-unit cap that bounds the worst-case
+        // retry tail when the first commit attempt is unusually slow
+        // (e.g. a dataset with hundreds of thousands of accumulated
+        // manifest versions). Mirrors the call-site math at the
+        // `Err(CommitError::CommitConflict)` branch above.
+        let slow_first_attempt_ms: u128 = 3_000;
+        let raw = (slow_first_attempt_ms * 11 / 10) as u32;
+        assert_eq!(raw, 3_300, "raw 1.1x scale");
+        assert_eq!(
+            raw.min(MAX_AUTO_TUNED_UNIT_MS),
+            MAX_AUTO_TUNED_UNIT_MS,
+            "slow first attempt clamps to the cap",
+        );
+
+        let fast_first_attempt_ms: u128 = 200;
+        let raw = (fast_first_attempt_ms * 11 / 10) as u32;
+        assert_eq!(raw, 220, "raw 1.1x scale");
+        assert_eq!(
+            raw.min(MAX_AUTO_TUNED_UNIT_MS),
+            220,
+            "fast first attempt passes through unchanged",
+        );
+    }
 
     async fn test_commit_handler(handler: Arc<dyn CommitHandler>, should_succeed: bool) {
         // Create a dataset, passing handler as commit handler
