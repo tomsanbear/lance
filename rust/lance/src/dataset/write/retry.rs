@@ -13,6 +13,10 @@ use lance_core::{Error, Result};
 
 use crate::Dataset;
 
+/// Maximum value, in milliseconds, that the auto-tuned `SlotBackoff::unit`
+/// is allowed to take. See the call site for the rationale.
+const MAX_AUTO_TUNED_UNIT_MS: u32 = 500;
+
 /// Configuration for retry behavior
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
@@ -107,7 +111,18 @@ pub async fn execute_with_retry<E: RetryExecutor>(
                     // We pass the first attempt's time to the backoff so it's used
                     // as the unit for backoff time slots.
                     // See SlotBackoff implementation for more details on how this works.
-                    backoff = backoff.with_unit((start.elapsed().as_millis() * 11 / 10) as u32);
+                    //
+                    // The slot unit is capped at MAX_AUTO_TUNED_UNIT_MS so that a
+                    // first attempt that is slow for unrelated reasons (e.g. a
+                    // dataset with hundreds of thousands of accumulated manifest
+                    // versions, where the initial manifest read + write itself
+                    // takes seconds) does not compound via the exponential slot
+                    // doubling into 30+ second retry tails. The cap is roughly
+                    // one S3 round-trip — short enough to bound the tail, long
+                    // enough that genuinely-contended writers can finish between
+                    // attempts.
+                    let auto_unit = (start.elapsed().as_millis() * 11 / 10) as u32;
+                    backoff = backoff.with_unit(auto_unit.min(MAX_AUTO_TUNED_UNIT_MS));
                 }
 
                 let sleep_fut = tokio::time::sleep(backoff.next_backoff());
@@ -127,4 +142,33 @@ pub async fn execute_with_retry<E: RetryExecutor>(
         "Attempted {} retries.",
         config.max_retries
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MAX_AUTO_TUNED_UNIT_MS;
+
+    #[test]
+    fn auto_tuned_backoff_unit_capped_at_max() {
+        // Pins the per-attempt slot-unit cap on the merge_insert /
+        // update / delete retry path. Mirrors the call-site math at
+        // `execute_with_retry` above.
+        let slow_first_attempt_ms: u128 = 3_000;
+        let raw = (slow_first_attempt_ms * 11 / 10) as u32;
+        assert_eq!(raw, 3_300, "raw 1.1x scale");
+        assert_eq!(
+            raw.min(MAX_AUTO_TUNED_UNIT_MS),
+            MAX_AUTO_TUNED_UNIT_MS,
+            "slow first attempt clamps to the cap",
+        );
+
+        let fast_first_attempt_ms: u128 = 200;
+        let raw = (fast_first_attempt_ms * 11 / 10) as u32;
+        assert_eq!(raw, 220, "raw 1.1x scale");
+        assert_eq!(
+            raw.min(MAX_AUTO_TUNED_UNIT_MS),
+            220,
+            "fast first attempt passes through unchanged",
+        );
+    }
 }
