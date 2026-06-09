@@ -232,6 +232,18 @@ pub struct CompactionOptions {
     /// so every row keeps its id. It also assumes uniform per-row version
     /// sequences (the only shape Lance currently writes for appends).
     pub sort_by: Option<Vec<String>>,
+    /// Sealed-fragment cutoff. When `Some(id)`, the planner excludes any
+    /// fragment with `fragment.id < id` from size-driven merging
+    /// (`CompactWithNeighbors`), partitioning the dataset's fragment-id space
+    /// into a "sealed past" (not re-merged by routine compaction) and an
+    /// "active window" (compacts normally). Sealed fragments remain eligible
+    /// for deletion materialization (`CompactItself`) so tombstoned rows are
+    /// still reclaimed once `materialize_deletions_threshold` is crossed —
+    /// without this carve-out, deleted rows in sealed fragments would stay
+    /// masked on disk forever. `None` (the default) preserves the historical
+    /// behavior where every fragment under `target_rows_per_fragment` is
+    /// eligible.
+    pub min_compactable_fragment_id: Option<u64>,
 }
 
 #[allow(deprecated)]
@@ -255,6 +267,7 @@ impl Default for CompactionOptions {
             transaction_properties: None,
             io_buffer_size_bytes: None,
             sort_by: None,
+            min_compactable_fragment_id: None,
         }
     }
 }
@@ -280,6 +293,8 @@ impl CompactionOptions {
     /// - `lance.compaction.max_source_fragments`
     /// - `lance.compaction.io_buffer_size_bytes`
     /// - `lance.compaction.sort_by` (comma-separated clustering column names)
+    /// - `lance.compaction.min_compactable_fragment_id` (u64; planner excludes
+    ///   fragments with id below this value)
     pub fn from_dataset_config(config: &HashMap<String, String>) -> Result<Self> {
         let mut opts = Self::default();
         opts.apply_dataset_config(config)?;
@@ -396,6 +411,14 @@ impl CompactionOptions {
                         .map(str::to_string)
                         .collect();
                     self.sort_by = (!cols.is_empty()).then_some(cols);
+                }
+                "min_compactable_fragment_id" => {
+                    self.min_compactable_fragment_id = Some(value.parse().map_err(|_| {
+                        Error::invalid_input(format!(
+                            "Invalid value for {}: '{}' (expected a non-negative integer)",
+                            key, value
+                        ))
+                    })?);
                 }
                 _ => {
                     warn!("Ignoring unknown compaction config key: {}", key);
@@ -675,10 +698,25 @@ impl CompactionPlanner for DefaultCompactionPlanner {
         while let Some(res) = fragment_metrics.next().await {
             let (fragment, metrics) = res?;
 
+            // Sealed-id cutoff: a fragment with id below
+            // `min_compactable_fragment_id` is excluded from size-driven
+            // merging (`CompactWithNeighbors`) but stays eligible for
+            // deletion materialization (`CompactItself`) — sealing must not
+            // sever the tombstone-reclamation path, or deleted rows in
+            // sealed fragments would stay masked on disk forever. A `None`
+            // candidacy closes any open bin, so unsealed runs on either
+            // side of a sealed gap form separate bins. See
+            // `CompactionOptions::min_compactable_fragment_id`.
+            let id_excluded = self
+                .options
+                .min_compactable_fragment_id
+                .is_some_and(|min_id| fragment.id < min_id);
             let candidacy = if self.options.materialize_deletions
                 && metrics.deletion_percentage() > self.options.materialize_deletions_threshold
             {
                 Some(CompactionCandidacy::CompactItself)
+            } else if id_excluded {
+                None
             } else if metrics.physical_rows < self.options.target_rows_per_fragment {
                 // Only want to compact if their are neighbors to compact such that
                 // we can get a larger fragment.
@@ -2069,6 +2107,68 @@ mod tests {
         };
         let plan = plan_compaction(&dataset, &options).await.unwrap();
         assert_eq!(plan.tasks().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_min_compactable_fragment_id_seals_merging_not_reclamation() {
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        // 6 small fragments (ids 0..=5), 400 rows each.
+        let data = sample_data();
+        let reader = RecordBatchIterator::new(vec![Ok(data.slice(0, 2400))], data.schema());
+        let write_params = WriteParams {
+            max_rows_per_file: 400,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(reader, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        // Without the seal, all 6 fragments are merge candidates.
+        let mut options = CompactionOptions::default();
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert_eq!(plan.tasks().len(), 1);
+        assert_eq!(plan.tasks()[0].fragments.len(), 6);
+
+        // Seal ids < 3: only fragments 3..=5 may merge.
+        options.min_compactable_fragment_id = Some(3);
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert_eq!(plan.tasks().len(), 1);
+        let planned_ids: Vec<u64> = plan.tasks()[0].fragments.iter().map(|f| f.id).collect();
+        assert_eq!(planned_ids, vec![3, 4, 5]);
+
+        // CompactItself carve-out: deleting 25% of a SEALED fragment's rows
+        // (above the 10% materialize_deletions_threshold) makes it eligible
+        // again — sealing must not strand tombstoned rows on disk.
+        dataset.delete("a < 100").await.unwrap();
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        let mut all_planned: Vec<u64> = plan
+            .tasks()
+            .iter()
+            .flat_map(|t| t.fragments.iter().map(|f| f.id))
+            .collect();
+        all_planned.sort_unstable();
+        assert!(
+            all_planned.contains(&0),
+            "sealed fragment 0 with 25% deletions must re-enter the plan via CompactItself, got {all_planned:?}",
+        );
+        assert!(
+            !all_planned.contains(&1) && !all_planned.contains(&2),
+            "sealed fragments without deletions must stay out of the plan, got {all_planned:?}",
+        );
+
+        // Config round-trip: the planner reads the seal from manifest config.
+        let parsed = CompactionOptions::from_dataset_config(
+            &[(
+                "lance.compaction.min_compactable_fragment_id".to_string(),
+                "42".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap();
+        assert_eq!(parsed.min_compactable_fragment_id, Some(42));
     }
 
     #[tokio::test]
