@@ -97,13 +97,30 @@ pub async fn execute_with_retry<E: RetryExecutor>(
         let commit_future = maybe_timeout(&backoff, start, config.retry_timeout, commit_future);
 
         match commit_future.await? {
-            Ok(result) => return Ok(result),
+            Ok(result) => {
+                tracing::info!(
+                    event.name = "lance.write_retry.completed",
+                    attempts = backoff.attempt() + 1,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    outcome = "success",
+                    "lance write retry path completed",
+                );
+                return Ok(result);
+            }
             Err(Error::RetryableCommitConflict { .. }) => {
                 // Check whether we have exhausted our retries *before* we sleep.
                 if backoff.attempt() >= config.max_retries {
                     break;
                 }
                 if start.elapsed() > config.retry_timeout {
+                    tracing::info!(
+                        event.name = "lance.write_retry.completed",
+                        attempts = backoff.attempt() + 1,
+                        elapsed_ms = start.elapsed().as_millis() as u64,
+                        outcome = "timeout",
+                        retry_timeout_ms = config.retry_timeout.as_millis() as u64,
+                        "lance write retry path hit retry_timeout",
+                    );
                     return Err(timeout_error(config.retry_timeout, backoff.attempt() + 1));
                 }
                 if backoff.attempt() == 0 {
@@ -125,7 +142,15 @@ pub async fn execute_with_retry<E: RetryExecutor>(
                     backoff = backoff.with_unit(auto_unit.min(MAX_AUTO_TUNED_UNIT_MS));
                 }
 
-                let sleep_fut = tokio::time::sleep(backoff.next_backoff());
+                let sleep = backoff.next_backoff();
+                tracing::info!(
+                    event.name = "lance.write_retry.scheduled",
+                    attempt = backoff.attempt(),
+                    next_attempt = backoff.attempt() + 1,
+                    sleep_ms = sleep.as_millis() as u64,
+                    "lance write retry CAS conflict; sleeping before retry",
+                );
+                let sleep_fut = tokio::time::sleep(sleep);
                 let sleep_fut = maybe_timeout(&backoff, start, config.retry_timeout, sleep_fut);
                 sleep_fut.await?;
 
@@ -134,10 +159,28 @@ pub async fn execute_with_retry<E: RetryExecutor>(
                 dataset_ref = Arc::new(ds);
                 continue;
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                tracing::info!(
+                    event.name = "lance.write_retry.completed",
+                    attempts = backoff.attempt() + 1,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    outcome = "error",
+                    error = %e,
+                    "lance write retry path errored",
+                );
+                return Err(e);
+            }
         }
     }
 
+    tracing::info!(
+        event.name = "lance.write_retry.completed",
+        attempts = backoff.attempt() + 1,
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        outcome = "retries_exhausted",
+        max_retries = config.max_retries,
+        "lance write retry path retries exhausted",
+    );
     Err(Error::too_much_write_contention(format!(
         "Attempted {} retries.",
         config.max_retries

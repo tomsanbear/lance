@@ -1100,6 +1100,14 @@ pub(crate) async fn commit_transaction(
                         _ => {}
                     };
                 }
+                tracing::info!(
+                    event.name = "lance.commit.completed",
+                    attempts = backoff.attempt() + 1,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    target_version,
+                    outcome = "success",
+                    "lance commit transaction completed",
+                );
                 return Ok((manifest, manifest_location));
             }
             Err(CommitError::CommitConflict) => {
@@ -1132,7 +1140,17 @@ pub(crate) async fn commit_transaction(
                         &current_transaction_file,
                     )
                     .await;
-                    tokio::time::sleep(backoff.next_backoff()).await;
+                    let sleep = backoff.next_backoff();
+                    tracing::info!(
+                        event.name = "lance.commit.retry_scheduled",
+                        attempt = backoff.attempt(),
+                        next_attempt = next_attempt_i,
+                        sleep_ms = sleep.as_millis() as u64,
+                        target_version,
+                        read_version,
+                        "lance commit CAS conflict; sleeping before retry",
+                    );
+                    tokio::time::sleep(sleep).await;
                     continue;
                 } else {
                     break;
@@ -1141,12 +1159,30 @@ pub(crate) async fn commit_transaction(
             Err(CommitError::OtherError(err)) => {
                 cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file)
                     .await;
+                tracing::info!(
+                    event.name = "lance.commit.completed",
+                    attempts = backoff.attempt() + 1,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    target_version,
+                    outcome = "error",
+                    error = %err,
+                    "lance commit transaction errored",
+                );
                 return Err(err);
             }
         }
     }
 
     cleanup_transaction_file(object_store, &dataset.base, &current_transaction_file).await;
+    tracing::info!(
+        event.name = "lance.commit.completed",
+        attempts = backoff.attempt() + 1,
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        target_version,
+        outcome = "retries_exhausted",
+        max_retries = commit_config.num_retries,
+        "lance commit retries exhausted",
+    );
     Err(crate::Error::commit_conflict_source(
         target_version,
         format!(
