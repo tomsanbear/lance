@@ -1576,7 +1576,9 @@ async fn recalc_versions_for_rewritten_fragments(
         let row_count = if let Some(row_id_meta) = &frag.row_id_meta {
             match row_id_meta {
                 RowIdMeta::Inline(data) => lance_table::rowids::read_row_ids(data)?.len(),
-                RowIdMeta::External(_file) => frag.physical_rows.unwrap_or(0) as u64,
+                RowIdMeta::External(_file) => {
+                    super::rowids::load_row_id_sequence(dataset, frag).await?.len()
+                }
             }
         } else {
             frag.physical_rows.unwrap_or(0) as u64
@@ -1584,9 +1586,11 @@ async fn recalc_versions_for_rewritten_fragments(
 
         // Load created_at sequence (default to version 1 if missing)
         let mut created_at_seq = if let Some(version_meta) = &frag.created_at_version_meta {
-            version_meta.load_sequence().map_err(|e| {
-                Error::internal(format!("Failed to load created_at version sequence: {}", e))
-            })?
+            super::rowids::load_version_sequence(dataset, version_meta)
+                .await
+                .map_err(|e| {
+                    Error::internal(format!("Failed to load created_at version sequence: {}", e))
+                })?
         } else {
             // Default: treat all rows as created at version 1
             lance_table::format::RowDatasetVersionSequence::from_uniform_row_count(row_count, 1)
@@ -1594,12 +1598,14 @@ async fn recalc_versions_for_rewritten_fragments(
 
         // Load last_updated_at sequence (default to same as created_at sequence)
         let mut last_updated_seq = if let Some(version_meta) = &frag.last_updated_at_version_meta {
-            version_meta.load_sequence().map_err(|e| {
-                Error::internal(format!(
-                    "Failed to load last_updated_at version sequence: {}",
-                    e
-                ))
-            })?
+            super::rowids::load_version_sequence(dataset, version_meta)
+                .await
+                .map_err(|e| {
+                    Error::internal(format!(
+                        "Failed to load last_updated_at version sequence: {}",
+                        e
+                    ))
+                })?
         } else {
             created_at_seq.clone()
         };

@@ -35,6 +35,7 @@
 
 use super::refs::TagContents;
 use crate::dataset::TRANSACTIONS_DIR;
+use crate::dataset::rowids;
 use crate::{Dataset, utils::temporal::utc_now};
 use chrono::{DateTime, TimeDelta, Utc};
 use dashmap::DashSet;
@@ -46,11 +47,11 @@ use lance_core::{
     Error, Result,
     utils::tracing::{
         AUDIT_MODE_DELETE, AUDIT_MODE_DELETE_UNVERIFIED, AUDIT_TYPE_DATA, AUDIT_TYPE_DELETION,
-        AUDIT_TYPE_INDEX, AUDIT_TYPE_MANIFEST, TRACE_FILE_AUDIT,
+        AUDIT_TYPE_INDEX, AUDIT_TYPE_MANIFEST, AUDIT_TYPE_ROW_META, TRACE_FILE_AUDIT,
     },
 };
 use lance_table::{
-    format::{IndexMetadata, Manifest},
+    format::{IndexMetadata, Manifest, RowDatasetVersionMeta, RowIdMeta},
     io::{
         commit::ManifestLocation,
         deletion::deletion_file_path,
@@ -75,6 +76,7 @@ struct ReferencedFiles {
     data_paths: HashSet<Path>,
     delete_paths: HashSet<Path>,
     tx_paths: HashSet<Path>,
+    row_meta_paths: HashSet<Path>,
     index_uuids: HashSet<String>,
 }
 
@@ -86,6 +88,7 @@ pub struct RemovalStats {
     pub transaction_files_removed: u64,
     pub index_files_removed: u64,
     pub deletion_files_removed: u64,
+    pub row_meta_files_removed: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -94,6 +97,7 @@ enum RemovedFileType {
     Transaction,
     Index,
     Deletion,
+    RowMeta,
 }
 
 fn remove_prefix(path: &Path, prefix: &Path) -> Path {
@@ -203,6 +207,7 @@ impl<'a> CleanupTask<'a> {
         final_stats.transaction_files_removed += stats.transaction_files_removed;
         final_stats.index_files_removed += stats.index_files_removed;
         final_stats.deletion_files_removed += stats.deletion_files_removed;
+        final_stats.row_meta_files_removed += stats.row_meta_files_removed;
         Ok(final_stats)
     }
 
@@ -302,6 +307,25 @@ impl<'a> CleanupTask<'a> {
                 let relative_path = remove_prefix(&delpath, &self.dataset.base);
                 referenced_files.delete_paths.insert(relative_path);
             }
+            if let Some(RowIdMeta::External(external_file)) = &fragment.row_id_meta {
+                referenced_files
+                    .row_meta_paths
+                    .insert(Path::parse(external_file.path.as_str())?);
+            }
+            if let Some(RowDatasetVersionMeta::External(external_file)) =
+                &fragment.created_at_version_meta
+            {
+                referenced_files
+                    .row_meta_paths
+                    .insert(Path::parse(external_file.path.as_str())?);
+            }
+            if let Some(RowDatasetVersionMeta::External(external_file)) =
+                &fragment.last_updated_at_version_meta
+            {
+                referenced_files
+                    .row_meta_paths
+                    .insert(Path::parse(external_file.path.as_str())?);
+            }
         }
         if let Some(relative_tx_path) = &manifest.transaction_file {
             referenced_files
@@ -384,6 +408,7 @@ impl<'a> CleanupTask<'a> {
                                 }
                                 RemovedFileType::Index => stats.index_files_removed += 1,
                                 RemovedFileType::Deletion => stats.deletion_files_removed += 1,
+                                RemovedFileType::RowMeta => stats.row_meta_files_removed += 1,
                             }
                         }
                     }
@@ -405,6 +430,7 @@ impl<'a> CleanupTask<'a> {
                 self.dataset.deletions_dir(),
                 Some(RemovedFileType::Deletion),
             ),
+            build_listing_stream(self.dataset.rowids_dir(), Some(RemovedFileType::RowMeta)),
         ];
         let unreferenced_paths = stream::iter(streams).flatten().boxed();
 
@@ -660,6 +686,31 @@ impl<'a> CleanupTask<'a> {
                     Ok(None)
                 }
             }
+            Some("rowmeta") => {
+                if relative_path.as_ref().starts_with(rowids::ROWIDS_DIR) {
+                    if inspection
+                        .referenced_files
+                        .row_meta_paths
+                        .contains(&relative_path)
+                    {
+                        Ok(None)
+                    } else if !maybe_in_progress {
+                        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE_UNVERIFIED, r#type=AUDIT_TYPE_ROW_META, path = path.to_string());
+                        Ok(Some(path))
+                    } else if inspection
+                        .verified_files
+                        .row_meta_paths
+                        .contains(&relative_path)
+                    {
+                        info!(target: TRACE_FILE_AUDIT, mode=AUDIT_MODE_DELETE, r#type=AUDIT_TYPE_ROW_META, path = path.to_string());
+                        Ok(Some(path))
+                    } else {
+                        Ok(None)
+                    }
+                } else {
+                    Ok(None)
+                }
+            }
             _ => Ok(None),
         }
     }
@@ -758,6 +809,7 @@ impl<'a> CleanupTask<'a> {
                                 stats.transaction_files_removed;
                             stats_guard.index_files_removed += stats.index_files_removed;
                             stats_guard.deletion_files_removed += stats.deletion_files_removed;
+                            stats_guard.row_meta_files_removed += stats.row_meta_files_removed;
                         }
                     }
                     Ok::<(), Error>(())

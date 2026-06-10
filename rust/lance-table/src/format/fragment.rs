@@ -447,6 +447,29 @@ pub struct ExternalFile {
     pub size: u64,
 }
 
+/// Default for [`row_meta_inline_threshold_bytes`]: the 200 KiB the format
+/// spec (`table.proto`) documents on each `DataFragment` storage oneof.
+pub const DEFAULT_ROW_META_INLINE_THRESHOLD_BYTES: usize = 200 * 1024;
+
+/// Serialized row-meta sequences (row ids, created_at / last_updated_at
+/// versions) larger than this are stored in an external file instead of
+/// inline in the manifest. Inline storage re-pays the sequence's size on
+/// every commit (the manifest is a full snapshot); external storage pays it
+/// once per fragment rewrite.
+///
+/// Overridable via `LANCE_ROW_META_INLINE_THRESHOLD_BYTES` (read once per
+/// process) so operators can tune the spill point — and tests can force
+/// spilling at toy scale — without a rebuild.
+pub fn row_meta_inline_threshold_bytes() -> usize {
+    static THRESHOLD: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("LANCE_ROW_META_INLINE_THRESHOLD_BYTES")
+            .ok()
+            .and_then(|raw| raw.parse().ok())
+            .unwrap_or(DEFAULT_ROW_META_INLINE_THRESHOLD_BYTES)
+    });
+    *THRESHOLD
+}
+
 /// Metadata about location of the row id sequence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
 pub enum RowIdMeta {

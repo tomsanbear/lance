@@ -6,11 +6,23 @@ use crate::session::caches::{RowIdIndexKey, RowIdSequenceKey};
 use crate::{Error, Result};
 use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt};
 use lance_core::utils::deletion::DeletionVector;
+use lance_core::utils::path::LancePathExt;
+use lance_io::object_store::ObjectStore;
 use lance_table::{
-    format::{Fragment, RowIdMeta},
-    rowids::{FragmentRowIdIndex, RowIdIndex, RowIdSequence, read_row_ids},
+    format::{
+        ExternalFile, Fragment, RowDatasetVersionMeta, RowDatasetVersionSequence, RowIdMeta,
+        row_meta_inline_threshold_bytes,
+    },
+    rowids::{FragmentRowIdIndex, RowIdIndex, RowIdSequence, read_row_ids, version},
 };
+use object_store::path::Path;
+use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Directory under the dataset root holding externalized row-meta sequences
+/// (row ids and created_at / last_updated_at version sequences too large to
+/// store inline in the manifest).
+pub const ROWIDS_DIR: &str = "_rowids";
 
 /// Load a row id sequence from the given dataset and fragment.
 pub async fn load_row_id_sequence(
@@ -39,15 +51,12 @@ pub async fn load_row_id_sequence(
             dataset
                 .metadata_cache
                 .get_or_insert_with_key(key, || async move {
-                    let path = dataset_clone.base.clone().join(file_slice.path.as_str());
-                    let range = file_slice.offset as usize
-                        ..(file_slice.offset as usize + file_slice.size as usize);
-                    let data = dataset_clone
-                        .object_store
-                        .open(&path)
-                        .await?
-                        .get_range(range)
-                        .await?;
+                    let data = read_external_meta_bytes(
+                        &dataset_clone.object_store,
+                        &dataset_clone.base,
+                        &file_slice,
+                    )
+                    .await?;
                     read_row_ids(&data)
                 })
                 .await
@@ -127,6 +136,226 @@ async fn load_row_id_index(dataset: &Dataset) -> Result<lance_table::rowids::Row
     let index = RowIdIndex::new(&fragment_indices)?;
 
     Ok(index)
+}
+
+/// Which of the three per-fragment row-meta sequences a map entry refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum RowMetaKind {
+    RowId,
+    CreatedAtVersion,
+    LastUpdatedAtVersion,
+}
+
+const ALL_ROW_META_KINDS: [RowMetaKind; 3] = [
+    RowMetaKind::RowId,
+    RowMetaKind::CreatedAtVersion,
+    RowMetaKind::LastUpdatedAtVersion,
+];
+
+/// Bytes and original location of row metas that were pulled inline for a
+/// transaction's sync apply logic. Lets the spill pass reuse the original
+/// external reference for sequences the transaction left untouched instead
+/// of rewriting identical bytes on every commit.
+#[derive(Debug, Default)]
+pub(crate) struct HydratedRowMetas {
+    entries: HashMap<(u64, RowMetaKind), (ExternalFile, Vec<u8>)>,
+}
+
+/// Whether any of the fragment's three row-meta sequences is stored
+/// externally. Cheap pre-check so commit paths only clone the manifest for
+/// hydration when there is actually something to hydrate.
+pub(crate) fn fragment_has_external_row_meta(fragment: &Fragment) -> bool {
+    ALL_ROW_META_KINDS
+        .iter()
+        .any(|kind| external_file(fragment, *kind).is_some())
+}
+
+fn inline_bytes(fragment: &Fragment, kind: RowMetaKind) -> Option<&[u8]> {
+    match kind {
+        RowMetaKind::RowId => match &fragment.row_id_meta {
+            Some(RowIdMeta::Inline(data)) => Some(data.as_slice()),
+            _ => None,
+        },
+        RowMetaKind::CreatedAtVersion => match &fragment.created_at_version_meta {
+            Some(RowDatasetVersionMeta::Inline(data)) => Some(data.as_ref()),
+            _ => None,
+        },
+        RowMetaKind::LastUpdatedAtVersion => match &fragment.last_updated_at_version_meta {
+            Some(RowDatasetVersionMeta::Inline(data)) => Some(data.as_ref()),
+            _ => None,
+        },
+    }
+}
+
+fn external_file(fragment: &Fragment, kind: RowMetaKind) -> Option<&ExternalFile> {
+    match kind {
+        RowMetaKind::RowId => match &fragment.row_id_meta {
+            Some(RowIdMeta::External(file)) => Some(file),
+            _ => None,
+        },
+        RowMetaKind::CreatedAtVersion => match &fragment.created_at_version_meta {
+            Some(RowDatasetVersionMeta::External(file)) => Some(file),
+            _ => None,
+        },
+        RowMetaKind::LastUpdatedAtVersion => match &fragment.last_updated_at_version_meta {
+            Some(RowDatasetVersionMeta::External(file)) => Some(file),
+            _ => None,
+        },
+    }
+}
+
+fn set_external(fragment: &mut Fragment, kind: RowMetaKind, file: ExternalFile) {
+    match kind {
+        RowMetaKind::RowId => fragment.row_id_meta = Some(RowIdMeta::External(file)),
+        RowMetaKind::CreatedAtVersion => {
+            fragment.created_at_version_meta = Some(RowDatasetVersionMeta::External(file));
+        }
+        RowMetaKind::LastUpdatedAtVersion => {
+            fragment.last_updated_at_version_meta = Some(RowDatasetVersionMeta::External(file));
+        }
+    }
+}
+
+fn set_inline(fragment: &mut Fragment, kind: RowMetaKind, bytes: Vec<u8>) {
+    match kind {
+        RowMetaKind::RowId => fragment.row_id_meta = Some(RowIdMeta::Inline(bytes)),
+        RowMetaKind::CreatedAtVersion => {
+            fragment.created_at_version_meta =
+                Some(RowDatasetVersionMeta::Inline(Arc::from(bytes)));
+        }
+        RowMetaKind::LastUpdatedAtVersion => {
+            fragment.last_updated_at_version_meta =
+                Some(RowDatasetVersionMeta::Inline(Arc::from(bytes)));
+        }
+    }
+}
+
+async fn read_external_meta_bytes(
+    object_store: &ObjectStore,
+    base_path: &Path,
+    file: &ExternalFile,
+) -> Result<Vec<u8>> {
+    // `Path::join` percent-encodes a separator inside its argument, so the
+    // multi-segment relative path must be joined part-by-part.
+    let path = base_path.child_path(&Path::parse(file.path.as_str())?);
+    let range = file.offset as usize..(file.offset as usize + file.size as usize);
+    let data = object_store.open(&path).await?.get_range(range).await?;
+    Ok(data.to_vec())
+}
+
+/// Load a created_at / last_updated_at version sequence, resolving external
+/// storage through the dataset's object store.
+///
+/// No sequence cache: version sequences are only read on compaction rewrites
+/// and on scans that explicitly project `_row_created_at_version` /
+/// `_row_last_updated_at_version` — both cold paths, unlike row-id sequences
+/// which back the per-query row-id index.
+pub async fn load_version_sequence(
+    dataset: &Dataset,
+    meta: &RowDatasetVersionMeta,
+) -> Result<RowDatasetVersionSequence> {
+    match meta {
+        RowDatasetVersionMeta::Inline(_) => Ok(meta.load_sequence()?),
+        RowDatasetVersionMeta::External(file) => {
+            let bytes =
+                read_external_meta_bytes(&dataset.object_store, &dataset.base, file).await?;
+            Ok(version::read_dataset_versions(&bytes)?)
+        }
+    }
+}
+
+/// Pull externally-stored row metas inline (in memory only) so a
+/// transaction's sync apply logic — which can only decode `Inline` metas —
+/// sees every sequence. Returns the original external references so
+/// [`externalize_large_row_metas`] can restore them for sequences the
+/// transaction did not change.
+pub(crate) async fn hydrate_external_row_metas(
+    object_store: &ObjectStore,
+    base_path: &Path,
+    fragments: &mut [Fragment],
+) -> Result<HydratedRowMetas> {
+    let mut hydrated = HydratedRowMetas::default();
+    for fragment in fragments.iter_mut() {
+        for kind in ALL_ROW_META_KINDS {
+            let Some(file) = external_file(fragment, kind).cloned() else {
+                continue;
+            };
+            let bytes = read_external_meta_bytes(object_store, base_path, &file).await?;
+            hydrated
+                .entries
+                .insert((fragment.id, kind), (file, bytes.clone()));
+            set_inline(fragment, kind, bytes);
+        }
+    }
+    Ok(hydrated)
+}
+
+/// Move every inline row-meta sequence larger than
+/// [`row_meta_inline_threshold_bytes`] out of the manifest into a shared
+/// external file under [`ROWIDS_DIR`], so the manifest re-pays only a
+/// ~50-byte reference per commit instead of the full sequence.
+///
+/// Sequences whose bytes match a [`HydratedRowMetas`] entry get their
+/// original external reference back without any write. All sequences spilled
+/// by one call share a single object (`file_name`) at distinct offsets.
+/// Returns the number of sequences written to the external file.
+pub(crate) async fn externalize_large_row_metas(
+    object_store: &ObjectStore,
+    base_path: &Path,
+    fragments: &mut [Fragment],
+    file_name: &str,
+    hydrated: &HydratedRowMetas,
+) -> Result<usize> {
+    // Pass 1 (read-only): restore unchanged hydrated sequences and collect
+    // the (fragment index, kind, offset, size) layout of genuinely new
+    // oversized sequences into one buffer.
+    let mut restores: Vec<(usize, RowMetaKind, ExternalFile)> = Vec::new();
+    let mut spills: Vec<(usize, RowMetaKind, u64, u64)> = Vec::new();
+    let mut buffer: Vec<u8> = Vec::new();
+    let relative_path = format!("{ROWIDS_DIR}/{file_name}");
+
+    let threshold_bytes = row_meta_inline_threshold_bytes();
+    for (fragment_index, fragment) in fragments.iter().enumerate() {
+        for kind in ALL_ROW_META_KINDS {
+            let Some(bytes) = inline_bytes(fragment, kind) else {
+                continue;
+            };
+            if bytes.len() <= threshold_bytes {
+                continue;
+            }
+            if let Some((file, original_bytes)) = hydrated.entries.get(&(fragment.id, kind))
+                && original_bytes.as_slice() == bytes
+            {
+                restores.push((fragment_index, kind, file.clone()));
+                continue;
+            }
+            let offset = buffer.len() as u64;
+            buffer.extend_from_slice(bytes);
+            spills.push((fragment_index, kind, offset, bytes.len() as u64));
+        }
+    }
+
+    if !buffer.is_empty() {
+        let full_path = base_path.clone().join(ROWIDS_DIR).join(file_name);
+        object_store.put(&full_path, &buffer).await?;
+    }
+
+    let spilled_count = spills.len();
+    for (fragment_index, kind, file) in restores {
+        set_external(&mut fragments[fragment_index], kind, file);
+    }
+    for (fragment_index, kind, offset, size) in spills {
+        set_external(
+            &mut fragments[fragment_index],
+            kind,
+            ExternalFile {
+                path: relative_path.clone(),
+                offset,
+                size,
+            },
+        );
+    }
+    Ok(spilled_count)
 }
 
 #[cfg(test)]
@@ -669,5 +898,239 @@ mod test {
                 assert_eq!(category.value(idx), 999);
             }
         }
+    }
+
+    /// Force every row-meta sequence to spill to external storage so the
+    /// full external pipeline is exercised at toy scale.
+    fn force_tiny_row_meta_threshold() {
+        // SAFETY: nextest runs each test in its own process and the
+        // threshold LazyLock has not been read before this call.
+        unsafe { std::env::set_var("LANCE_ROW_META_INLINE_THRESHOLD_BYTES", "8") };
+    }
+
+    fn external_row_meta_files(fragments: &[Fragment]) -> HashSet<String> {
+        let mut paths = HashSet::new();
+        for fragment in fragments {
+            if let Some(RowIdMeta::External(file)) = &fragment.row_id_meta {
+                paths.insert(file.path.clone());
+            }
+            if let Some(lance_table::format::RowDatasetVersionMeta::External(file)) =
+                &fragment.created_at_version_meta
+            {
+                paths.insert(file.path.clone());
+            }
+            if let Some(lance_table::format::RowDatasetVersionMeta::External(file)) =
+                &fragment.last_updated_at_version_meta
+            {
+                paths.insert(file.path.clone());
+            }
+        }
+        paths
+    }
+
+    async fn list_rowids_dir(dataset: &Dataset) -> HashSet<String> {
+        let base = dataset.base.clone();
+        dataset
+            .object_store
+            .read_dir_all(&dataset.rowids_dir(), None)
+            .map_ok(|meta| {
+                meta.location
+                    .prefix_match(&base)
+                    .map(|parts| object_store::path::Path::from_iter(parts).to_string())
+                    .unwrap_or_else(|| meta.location.to_string())
+            })
+            .try_collect::<HashSet<_>>()
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Dataset for the externalization tests: 6 fragments x 10 rows with
+    /// stable row ids, on a real tempdir (cleanup needs a listable store).
+    async fn external_meta_test_dataset(
+        tmp_path: &str,
+    ) -> (Dataset, HashMap<u64, i32>) {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "category",
+                lance_datagen::array::cycle::<Int32Type>(vec![1, 2, 3]),
+            )
+            .into_dataset_with_params(
+                tmp_path,
+                FragmentCount::from(6),
+                FragmentRowCount::from(10),
+                Some(WriteParams {
+                    max_rows_per_file: 10,
+                    enable_stable_row_ids: true,
+                    enable_v2_manifest_paths: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        delete(&mut dataset, "i = 2 or i = 17").await;
+        let map_before = scan_rowid_map(&dataset).await;
+        compact(&mut dataset, 30).await;
+        (dataset, map_before)
+    }
+
+    #[tokio::test]
+    async fn test_row_metas_externalize_on_commit_and_read_back() {
+        force_tiny_row_meta_threshold();
+        let tmp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let (dataset, map_before) = external_meta_test_dataset(&tmp_dir).await;
+
+        // The compaction rewrite re-assigned every sequence inline; the
+        // commit spill must have moved them out of the manifest.
+        let externals = external_row_meta_files(&dataset.manifest.fragments);
+        assert!(
+            !externals.is_empty(),
+            "compaction commit must externalize row metas over the threshold, fragments: {:?}",
+            dataset.manifest.fragments,
+        );
+        let on_disk = list_rowids_dir(&dataset).await;
+        for path in &externals {
+            assert!(on_disk.contains(path), "{path} referenced but missing from _rowids: {on_disk:?}");
+        }
+
+        // Row-id index loads through the external read path and row ids are
+        // unchanged by the spill.
+        let map_after = scan_rowid_map(&dataset).await;
+        assert_eq!(map_before, map_after);
+        let index = get_row_id_index(&dataset).await.unwrap().unwrap();
+        assert!(index.get(0).is_some());
+
+        // Version columns read through the external version-sequence loader.
+        let mut scan = dataset.scan();
+        scan.project(&["i", lance_core::ROW_CREATED_AT_VERSION]).unwrap();
+        let result = scan.try_into_batch().await.unwrap();
+        let created = result[lance_core::ROW_CREATED_AT_VERSION]
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert!(
+            created.values().iter().all(|v| *v == 1),
+            "all rows were created at version 1, got {created:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_after_externalization_preserves_created_at() {
+        force_tiny_row_meta_threshold();
+        let tmp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let (dataset, _) = external_meta_test_dataset(&tmp_dir).await;
+
+        let externals_before = external_row_meta_files(&dataset.manifest.fragments);
+        assert!(!externals_before.is_empty());
+
+        // The update's sync apply logic can only read Inline metas; the
+        // commit-path hydration must surface the externalized sequences so
+        // the rewritten row keeps its original created_at instead of being
+        // misclassified as an insert.
+        let update_result = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("i = 5")
+            .unwrap()
+            .set("category", "999")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        let dataset = update_result.new_dataset;
+        let updated_version = dataset.manifest.version;
+
+        let mut scan = dataset.scan();
+        scan.project(&[
+            "i",
+            lance_core::ROW_CREATED_AT_VERSION,
+            lance_core::ROW_LAST_UPDATED_AT_VERSION,
+        ])
+        .unwrap();
+        let result = scan.try_into_batch().await.unwrap();
+        let i = result["i"].as_any().downcast_ref::<Int32Array>().unwrap();
+        let created = result[lance_core::ROW_CREATED_AT_VERSION]
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        let updated = result[lance_core::ROW_LAST_UPDATED_AT_VERSION]
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        for idx in 0..i.len() {
+            assert_eq!(
+                created.value(idx),
+                1,
+                "row i={} must keep created_at=1 across the update",
+                i.value(idx),
+            );
+            if i.value(idx) == 5 {
+                assert_eq!(updated.value(idx), updated_version);
+            }
+        }
+
+        // Untouched fragments must reuse their original external references
+        // rather than rewriting identical bytes on every update commit.
+        let externals_after = external_row_meta_files(&dataset.manifest.fragments);
+        assert!(
+            externals_after.intersection(&externals_before).next().is_some(),
+            "unchanged fragments must keep their original external files; before: \
+             {externals_before:?}, after: {externals_after:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_retains_referenced_external_row_metas() {
+        force_tiny_row_meta_threshold();
+        // Manifest timestamps come from the mocked clock while the tempdir's
+        // file mtimes come from the real one, and cleanup's listing only
+        // yields files older than the earliest retained manifest. Park the
+        // mocked clock far past any real mtime so the listing sees the
+        // tempdir's files at all.
+        mock_instant::thread_local::MockClock::set_system_time(
+            std::time::Duration::from_secs(50_000 * 24 * 60 * 60),
+        );
+        let tmp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let (mut dataset, _) = external_meta_test_dataset(&tmp_dir).await;
+
+        // A second compaction supersedes the first pass's external files so
+        // the cleanup has genuine orphans-to-be once old versions age out.
+        delete(&mut dataset, "i = 30").await;
+        compact(&mut dataset, 60).await;
+        let map_before = scan_rowid_map(&dataset).await;
+        let referenced = external_row_meta_files(&dataset.manifest.fragments);
+        assert!(!referenced.is_empty());
+        let on_disk_before = list_rowids_dir(&dataset).await;
+        assert!(
+            on_disk_before.len() > referenced.len(),
+            "expected superseded external files on disk before cleanup; on disk: \
+             {on_disk_before:?}, referenced: {referenced:?}",
+        );
+
+        // Advance past every write above so all old manifests qualify
+        // (`timestamp < before_timestamp` is strict).
+        mock_instant::thread_local::MockClock::set_system_time(
+            std::time::Duration::from_secs(50_001 * 24 * 60 * 60),
+        );
+        let policy = crate::dataset::cleanup::CleanupPolicyBuilder::default()
+            .before_timestamp(crate::utils::temporal::utc_now())
+            .delete_unverified(true)
+            .build();
+        let stats = dataset.cleanup_with_policy(policy).await.unwrap();
+        assert!(
+            stats.row_meta_files_removed >= 1,
+            "cleanup must reclaim superseded external row-meta files, stats: {stats:?}",
+        );
+
+        let on_disk_after = list_rowids_dir(&dataset).await;
+        assert_eq!(
+            on_disk_after, referenced,
+            "after cleanup, _rowids must hold exactly the files the current manifest references",
+        );
+
+        // The surviving external files still serve reads.
+        let map_after = scan_rowid_map(&dataset).await;
+        assert_eq!(map_before, map_after);
     }
 }

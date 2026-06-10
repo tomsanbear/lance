@@ -43,7 +43,8 @@ use lance_io::utils::{
 };
 use lance_namespace::LanceNamespace;
 use lance_table::format::{
-    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest, RowIdMeta, pb,
+    DataFile, DataStorageFormat, DeletionFile, Fragment, IndexMetadata, Manifest,
+    RowDatasetVersionMeta, RowIdMeta, pb,
 };
 use lance_table::io::commit::{
     CommitConfig, CommitError, CommitHandler, CommitLock, ManifestLocation, ManifestNamingScheme,
@@ -1862,6 +1863,10 @@ impl Dataset {
         self.base.clone().join(VERSIONS_DIR)
     }
 
+    pub fn rowids_dir(&self) -> Path {
+        self.base.clone().join(rowids::ROWIDS_DIR)
+    }
+
     pub(crate) fn data_file_dir(&self, data_file: &DataFile) -> Result<Path> {
         self.data_file_dir_for_base(data_file.base_id)
     }
@@ -2668,12 +2673,23 @@ impl Dataset {
     /// Collect all (relative_path, path) of the dataset files.
     async fn collect_paths(&self) -> Result<Vec<(String, Path)>> {
         let mut file_paths: Vec<(String, Path)> = Vec::new();
+        // External row metas always live under the dataset's own base (the
+        // spill in `commit_transaction` writes them there); several fragments
+        // can reference distinct slices of one shared file, so dedupe.
+        let mut row_meta_paths: HashSet<String> = HashSet::new();
         for fragment in self.manifest.fragments.iter() {
             if let Some(RowIdMeta::External(external_file)) = &fragment.row_id_meta {
-                return Err(Error::internal(format!(
-                    "External row_id_meta is not supported yet. external file path: {}",
-                    external_file.path
-                )));
+                row_meta_paths.insert(external_file.path.clone());
+            }
+            if let Some(RowDatasetVersionMeta::External(external_file)) =
+                &fragment.created_at_version_meta
+            {
+                row_meta_paths.insert(external_file.path.clone());
+            }
+            if let Some(RowDatasetVersionMeta::External(external_file)) =
+                &fragment.last_updated_at_version_meta
+            {
+                row_meta_paths.insert(external_file.path.clone());
             }
             for data_file in fragment.files.iter() {
                 let base_root = if let Some(base_id) = data_file.base_id {
@@ -2706,6 +2722,11 @@ impl Dataset {
                 ));
             }
         }
+        file_paths.extend(
+            row_meta_paths
+                .into_iter()
+                .map(|relative_path| (relative_path, self.base.clone())),
+        );
 
         let indices = read_manifest_indexes(
             self.object_store.as_ref(),

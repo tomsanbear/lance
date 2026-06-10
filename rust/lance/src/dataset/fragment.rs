@@ -43,7 +43,7 @@ use lance_file::{LanceEncodingsIo, determine_file_version};
 use lance_io::ReadBatchParams;
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
-use lance_table::format::{DataFile, DeletionFile, Fragment};
+use lance_table::format::{DataFile, DeletionFile, Fragment, RowDatasetVersionSequence};
 use lance_table::io::deletion::{deletion_file_path, write_deletion_file};
 use lance_table::rowids::RowIdSequence;
 use lance_table::utils::stream::{
@@ -55,7 +55,7 @@ use roaring::RoaringBitmap;
 use self::write::FragmentCreateBuilder;
 
 use super::hash_joiner::HashJoiner;
-use super::rowids::load_row_id_sequence;
+use super::rowids::{load_row_id_sequence, load_version_sequence};
 use super::scanner::Scanner;
 
 use super::updater::Updater;
@@ -944,11 +944,26 @@ impl FileFragment {
         if read_config.with_row_address {
             reader.with_row_address();
         }
+        // Externally-stored version sequences need the object store, so they
+        // are resolved here (async) and handed to the sync builders — which
+        // would otherwise silently default every row to version 1.
         if read_config.with_row_last_updated_at_version {
-            reader.with_row_last_updated_at_version();
+            let resolved = match &self.metadata.last_updated_at_version_meta {
+                Some(meta @ lance_table::format::RowDatasetVersionMeta::External(_)) => Some(
+                    Arc::new(load_version_sequence(self.dataset.as_ref(), meta).await?),
+                ),
+                _ => None,
+            };
+            reader.with_row_last_updated_at_version(resolved);
         }
         if read_config.with_row_created_at_version {
-            reader.with_row_created_at_version();
+            let resolved = match &self.metadata.created_at_version_meta {
+                Some(meta @ lance_table::format::RowDatasetVersionMeta::External(_)) => Some(
+                    Arc::new(load_version_sequence(self.dataset.as_ref(), meta).await?),
+                ),
+                _ => None,
+            };
+            reader.with_row_created_at_version(resolved);
         }
 
         Ok(reader)
@@ -2163,15 +2178,25 @@ impl FragmentReader {
         self
     }
 
-    pub(crate) fn with_row_last_updated_at_version(&mut self) -> &mut Self {
+    /// `resolved_sequence` carries an externally-stored sequence loaded by
+    /// the async caller — this sync builder can only decode `Inline` metas
+    /// itself. `None` with an `External` meta would silently default every
+    /// row to version 1, so callers must resolve external metas first (see
+    /// `FileFragment::open`).
+    pub(crate) fn with_row_last_updated_at_version(
+        &mut self,
+        resolved_sequence: Option<Arc<RowDatasetVersionSequence>>,
+    ) -> &mut Self {
         self.with_row_last_updated_at_version = true;
 
-        // Load the version sequence if not already loaded
-        if self.last_updated_at_sequence.is_none()
-            && let Some(meta) = &self.fragment.last_updated_at_version_meta
-            && let Ok(sequence) = meta.load_sequence()
-        {
-            self.last_updated_at_sequence = Some(Arc::new(sequence));
+        if self.last_updated_at_sequence.is_none() {
+            if let Some(sequence) = resolved_sequence {
+                self.last_updated_at_sequence = Some(sequence);
+            } else if let Some(meta) = &self.fragment.last_updated_at_version_meta
+                && let Ok(sequence) = meta.load_sequence()
+            {
+                self.last_updated_at_sequence = Some(Arc::new(sequence));
+            }
         }
         // If no metadata or load fails, sequence remains None (will default to version 1)
 
@@ -2184,15 +2209,22 @@ impl FragmentReader {
         self
     }
 
-    pub(crate) fn with_row_created_at_version(&mut self) -> &mut Self {
+    /// See [`Self::with_row_last_updated_at_version`] for the
+    /// `resolved_sequence` contract.
+    pub(crate) fn with_row_created_at_version(
+        &mut self,
+        resolved_sequence: Option<Arc<RowDatasetVersionSequence>>,
+    ) -> &mut Self {
         self.with_row_created_at_version = true;
 
-        // Load the version sequence if not already loaded
-        if self.created_at_sequence.is_none()
-            && let Some(meta) = &self.fragment.created_at_version_meta
-            && let Ok(sequence) = meta.load_sequence()
-        {
-            self.created_at_sequence = Some(Arc::new(sequence));
+        if self.created_at_sequence.is_none() {
+            if let Some(sequence) = resolved_sequence {
+                self.created_at_sequence = Some(sequence);
+            } else if let Some(meta) = &self.fragment.created_at_version_meta
+                && let Ok(sequence) = meta.load_sequence()
+            {
+                self.created_at_sequence = Some(Arc::new(sequence));
+            }
         }
         // If no metadata or load fails, sequence remains None (will default to version 1)
 

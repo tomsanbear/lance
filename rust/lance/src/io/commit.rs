@@ -48,6 +48,7 @@ use crate::Dataset;
 const MAX_AUTO_TUNED_UNIT_MS: u32 = 500;
 use crate::dataset::cleanup::auto_cleanup_hook;
 use crate::dataset::fragment::FileFragment;
+use crate::dataset::rowids;
 use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::{
     ManifestWriteConfig, NewTransactionResult, TRANSACTIONS_DIR, load_new_transactions,
@@ -991,6 +992,34 @@ pub(crate) async fn commit_transaction(
             transaction = rebase.finish(&dataset).await?;
         }
 
+        // The sync apply logic inside `build_manifest` (e.g.
+        // `resolve_update_version_metadata`) can only decode Inline row
+        // metas; silently skipping External ones would reset `created_at`
+        // lineage for rows sourced from externalized fragments. Pull those
+        // sequences inline (in memory only) for the ops that read them. The
+        // spill before `write_manifest_file` restores untouched sequences to
+        // their original external references, so an Update over externalized
+        // fragments costs one read per sequence and no rewrite.
+        let hydrated_row_metas = if matches!(transaction.operation, Operation::Update { .. })
+            && dataset
+                .manifest
+                .fragments
+                .iter()
+                .any(rowids::fragment_has_external_row_meta)
+        {
+            let mut manifest_owned = dataset.manifest.as_ref().clone();
+            let hydrated = rowids::hydrate_external_row_metas(
+                object_store,
+                &dataset.base,
+                Arc::make_mut(&mut manifest_owned.fragments).as_mut_slice(),
+            )
+            .await?;
+            dataset.manifest = Arc::new(manifest_owned);
+            hydrated
+        } else {
+            rowids::HydratedRowMetas::default()
+        };
+
         current_transaction_file = if !write_config.disable_transaction_file() {
             write_transaction_file(object_store, &dataset.base, &transaction).await?
         } else {
@@ -1043,6 +1072,22 @@ pub(crate) async fn commit_transaction(
         check_column_indices(&manifest)?;
 
         migrate_indices(&dataset, &mut indices).await?;
+
+        // Manifests are full snapshots, so an inline row-meta sequence is
+        // re-paid on every commit; spill oversized ones to a per-transaction
+        // external file. Retries overwrite the same path, which is safe: a
+        // failed attempt's manifest never landed, so nothing references the
+        // earlier bytes.
+        let row_meta_file_name =
+            format!("{}-{}.rowmeta", transaction.read_version, transaction.uuid);
+        rowids::externalize_large_row_metas(
+            object_store,
+            &dataset.base,
+            Arc::make_mut(&mut manifest.fragments).as_mut_slice(),
+            &row_meta_file_name,
+            &hydrated_row_metas,
+        )
+        .await?;
 
         // Try to commit the manifest
         let result = write_manifest_file(

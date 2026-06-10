@@ -274,13 +274,21 @@ impl RowDatasetVersionMeta {
         Self::External(ExternalFile { path, offset, size })
     }
 
-    /// Load the version sequence from this metadata
+    /// Load the version sequence from this metadata.
+    ///
+    /// Only `Inline` metadata can be decoded here — resolving an `External`
+    /// reference requires object-store access, which lives a crate above.
+    /// Async callers must resolve `External` via
+    /// `lance::dataset::rowids::load_version_sequence` (or pre-hydrate the
+    /// fragment) before reaching sync code paths that call this.
     pub fn load_sequence(&self) -> lance_core::Result<RowDatasetVersionSequence> {
         match self {
             Self::Inline(data) => read_dataset_versions(data),
-            Self::External(_file) => {
-                todo!("External file loading not yet implemented")
-            }
+            Self::External(file) => Err(Error::internal(format!(
+                "version sequence is stored externally at '{}' (offset {}, size {}) and must \
+                 be loaded through the dataset's object store",
+                file.path, file.offset, file.size
+            ))),
         }
     }
 }
