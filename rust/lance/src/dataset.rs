@@ -3400,7 +3400,9 @@ pub(crate) async fn write_manifest_file(
 
     manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
-    manifest.update_max_fragment_id();
+    manifest
+        .update_max_fragment_id()
+        .map_err(|e| CommitError::OtherError(e))?;
 
     commit_handler
         .commit(

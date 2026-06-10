@@ -517,7 +517,15 @@ impl<'a> CreateIndexBuilder<'a> {
                     ext.create_index(self.dataset, column, &index_id.to_string(), self.params)
                         .await?;
                 } else {
-                    todo!("create empty vector index when train=false");
+                    // train=false means the dataset is empty (set
+                    // unconditionally above when count_rows == 0). The
+                    // builtin path builds an empty index; extensions have
+                    // no such hook, and a panic here is reachable from
+                    // plain user input.
+                    return Err(Error::not_supported(
+                        "creating an index on an empty dataset is not supported for custom \
+                         vector index extensions; insert data before indexing",
+                    ));
                 }
                 // Capture file sizes after vector index creation
                 let index_dir = self.dataset.indices_dir().join(index_id.to_string());

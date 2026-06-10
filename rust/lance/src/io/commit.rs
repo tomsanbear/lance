@@ -124,6 +124,42 @@ async fn cleanup_transaction_file(
     }
 }
 
+/// Hydrate externally-stored row metas for operations whose sync apply
+/// logic reads them.
+///
+/// `build_manifest`'s `Operation::Update` arm (and its helpers like
+/// `resolve_update_version_metadata`) can only decode `Inline` row
+/// metas; an `External` meta reaching that code would error the commit
+/// (or, before the loaders hardened, silently reset `created_at`
+/// lineage). Returns the manifest to build against — the original Arc
+/// when nothing needed hydration — plus the original external
+/// references so the pre-write spill can restore untouched sequences
+/// instead of rewriting identical bytes.
+async fn hydrated_manifest_for_operation(
+    object_store: &ObjectStore,
+    base: &Path,
+    operation: &Operation,
+    manifest: &Arc<Manifest>,
+) -> Result<(Arc<Manifest>, rowids::HydratedRowMetas)> {
+    if matches!(operation, Operation::Update { .. })
+        && manifest
+            .fragments
+            .iter()
+            .any(rowids::fragment_has_external_row_meta)
+    {
+        let mut manifest_owned = manifest.as_ref().clone();
+        let hydrated = rowids::hydrate_external_row_metas(
+            object_store,
+            base,
+            Arc::make_mut(&mut manifest_owned.fragments).as_mut_slice(),
+        )
+        .await?;
+        Ok((Arc::new(manifest_owned), hydrated))
+    } else {
+        Ok((manifest.clone(), rowids::HydratedRowMetas::default()))
+    }
+}
+
 /// Write a transaction to a file and return the relative path.
 pub(crate) async fn write_transaction_file(
     object_store: &ObjectStore,
@@ -704,7 +740,21 @@ async fn migrate_indices(dataset: &Dataset, indices: &mut [IndexMetadata]) -> Re
                     &NoOpMetricsCollector,
                 )
                 .await?;
-            index.fragment_bitmap = Some(idx.calculate_included_frags().await?);
+            match idx.calculate_included_frags().await {
+                Ok(bitmap) => index.fragment_bitmap = Some(bitmap),
+                // v2 vector indices cannot recalculate their bitmap; a v2
+                // index that lost it (written in a pre-bitmap transition
+                // window) must not kill every subsequent commit to the
+                // dataset. Leave the bitmap absent — the same state the
+                // dataset was already in — and surface the condition.
+                Err(Error::NotSupported { .. }) => log::warn!(
+                    "index {} has no fragment_bitmap and does not support recalculating it; \
+                     leaving it absent (queries treat coverage as unknown). Re-create the \
+                     index to restore an exact bitmap.",
+                    index.uuid,
+                ),
+                Err(e) => return Err(e),
+            }
         }
         // We can't reliably recalculate the index type for label_list and bitmap indices and so we can't migrate this field.
         // However, we still log for visibility and to help potentially diagnose issues in the future if we grow to rely on the field.
@@ -802,6 +852,17 @@ pub(crate) async fn do_commit_detached_transaction(
         String::new()
     };
 
+    // Same hydration the attached path does: build_manifest's Update arm
+    // can only decode Inline row metas. The base manifest is loop-invariant
+    // (detached commits never rebase), so hydrate once.
+    let (base_manifest, hydrated_row_metas) = hydrated_manifest_for_operation(
+        object_store,
+        &dataset.base,
+        &transaction.operation,
+        &dataset.manifest,
+    )
+    .await?;
+
     // We still do a loop since we may have conflicts in the random version we pick
     let mut backoff = Backoff::default();
     while backoff.attempt() < commit_config.num_retries {
@@ -822,7 +883,7 @@ pub(crate) async fn do_commit_detached_transaction(
                 .await?
             }
             _ => transaction.build_manifest(
-                Some(dataset.manifest.as_ref()),
+                Some(base_manifest.as_ref()),
                 dataset.load_indices().await?.as_ref().clone(),
                 &transaction_file,
                 write_config,
@@ -839,6 +900,19 @@ pub(crate) async fn do_commit_detached_transaction(
         check_storage_version(&mut manifest)?;
         check_column_indices(&manifest)?;
         migrate_indices(dataset, &mut indices).await?;
+
+        // Same oversized-row-meta spill as the attached commit path; see
+        // the comment there. Retries overwrite the same path safely.
+        let row_meta_file_name =
+            format!("{}-{}.rowmeta", transaction.read_version, transaction.uuid);
+        rowids::externalize_large_row_metas(
+            object_store,
+            &dataset.base,
+            Arc::make_mut(&mut manifest.fragments).as_mut_slice(),
+            &row_meta_file_name,
+            &hydrated_row_metas,
+        )
+        .await?;
 
         // Try to commit the manifest
         let result = write_manifest_file(
@@ -992,33 +1066,18 @@ pub(crate) async fn commit_transaction(
             transaction = rebase.finish(&dataset).await?;
         }
 
-        // The sync apply logic inside `build_manifest` (e.g.
-        // `resolve_update_version_metadata`) can only decode Inline row
-        // metas; silently skipping External ones would reset `created_at`
-        // lineage for rows sourced from externalized fragments. Pull those
-        // sequences inline (in memory only) for the ops that read them. The
-        // spill before `write_manifest_file` restores untouched sequences to
-        // their original external references, so an Update over externalized
-        // fragments costs one read per sequence and no rewrite.
-        let hydrated_row_metas = if matches!(transaction.operation, Operation::Update { .. })
-            && dataset
-                .manifest
-                .fragments
-                .iter()
-                .any(rowids::fragment_has_external_row_meta)
-        {
-            let mut manifest_owned = dataset.manifest.as_ref().clone();
-            let hydrated = rowids::hydrate_external_row_metas(
-                object_store,
-                &dataset.base,
-                Arc::make_mut(&mut manifest_owned.fragments).as_mut_slice(),
-            )
-            .await?;
-            dataset.manifest = Arc::new(manifest_owned);
-            hydrated
-        } else {
-            rowids::HydratedRowMetas::default()
-        };
+        // Hydration in memory only; the spill before `write_manifest_file`
+        // restores untouched sequences to their original external
+        // references, so an Update over externalized fragments costs one
+        // read per sequence and no rewrite.
+        let (hydrated_manifest, hydrated_row_metas) = hydrated_manifest_for_operation(
+            object_store,
+            &dataset.base,
+            &transaction.operation,
+            &dataset.manifest,
+        )
+        .await?;
+        dataset.manifest = hydrated_manifest;
 
         current_transaction_file = if !write_config.disable_transaction_file() {
             write_transaction_file(object_store, &dataset.base, &transaction).await?

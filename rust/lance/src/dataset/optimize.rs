@@ -617,10 +617,18 @@ pub struct CompactionMetrics {
 
 impl AddAssign for CompactionMetrics {
     fn add_assign(&mut self, rhs: Self) {
-        self.fragments_removed += rhs.fragments_removed;
-        self.fragments_added += rhs.fragments_added;
-        self.files_removed += rhs.files_removed;
-        self.files_added += rhs.files_added;
+        // Destructure so adding a field without merging it is a compile
+        // error rather than a silently-zero counter in returned metrics.
+        let Self {
+            fragments_removed,
+            fragments_added,
+            files_removed,
+            files_added,
+        } = rhs;
+        self.fragments_removed += fragments_removed;
+        self.fragments_added += fragments_added;
+        self.files_removed += files_removed;
+        self.files_added += files_added;
     }
 }
 

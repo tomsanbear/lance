@@ -1237,7 +1237,10 @@ impl VectorIndex for IVFIndex {
     }
 
     fn quantizer(&self) -> Quantizer {
-        unimplemented!("only for v2 IVFIndex")
+        // v1 IVF's only sub-index is PQ; delegate so legacy datasets keep
+        // working through clone / incremental-build / rebalance paths
+        // instead of panicking on a dyn-dispatched call.
+        self.sub_index.quantizer()
     }
 
     fn partition_size(&self, part_id: usize) -> usize {
@@ -1246,7 +1249,7 @@ impl VectorIndex for IVFIndex {
 
     /// the index type of this vector index.
     fn sub_index_type(&self) -> (SubIndexType, QuantizationType) {
-        unimplemented!("only for v2 IVFIndex")
+        self.sub_index.sub_index_type()
     }
 
     fn metric_type(&self) -> MetricType {

@@ -1162,9 +1162,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
     }
 
     async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
-        unimplemented!(
-            "this method is only needed for migrating older manifests, not for this new index"
-        )
+        // v2 indices write their fragment bitmap at creation time; there is
+        // no recalculation path. Reachable as data (a v2 index whose
+        // manifest entry lost its bitmap), so this must be an error the
+        // manifest migration can skip — not a panic that kills the commit.
+        Err(Error::not_supported(
+            "recalculating the fragment bitmap is not supported for v2 vector indices; \
+             the bitmap is written at index creation",
+        ))
     }
 }
 

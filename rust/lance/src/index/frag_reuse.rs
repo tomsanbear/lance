@@ -92,6 +92,16 @@ pub(crate) async fn open_frag_reuse_index(
     Ok(FragReuseIndex::new(uuid, row_id_maps, details.clone()))
 }
 
+/// Backstop on retained [`FragReuseVersion`]s. Every deferred-remap
+/// compaction appends one, the only pruning path
+/// ([`cleanup_frag_reuse_index`]) has no production caller, and the whole
+/// list rides in every manifest's index section — so without a bound a
+/// `defer_index_remap` deployment grows its manifests (and per-query index
+/// loads) without limit. Hitting the cap means remaps are not being
+/// cleaned up; failing the compaction commit is recoverable, unbounded
+/// growth is not.
+const MAX_FRAG_REUSE_VERSIONS: usize = 100;
+
 pub(crate) async fn build_new_frag_reuse_index(
     dataset: &mut Dataset,
     frag_reuse_groups: Vec<FragReuseGroup>,
@@ -115,6 +125,15 @@ pub(crate) async fn build_new_frag_reuse_index(
         },
         Some(index_meta) => {
             let current_details = load_frag_reuse_index_details(dataset, index_meta).await?;
+            if current_details.versions.len() >= MAX_FRAG_REUSE_VERSIONS {
+                return Err(lance_core::Error::invalid_input(format!(
+                    "fragment-reuse index already retains {} versions (cap {}); run \
+                     cleanup_frag_reuse_index (remap and prune stale reuse versions) before \
+                     more deferred-remap compactions",
+                    current_details.versions.len(),
+                    MAX_FRAG_REUSE_VERSIONS,
+                )));
+            }
             let mut versions = current_details.versions.clone();
             versions.push(new_version);
             FragReuseIndexDetails { versions }

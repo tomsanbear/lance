@@ -91,6 +91,30 @@ pub struct RemovalStats {
     pub row_meta_files_removed: u64,
 }
 
+impl std::ops::AddAssign for RemovalStats {
+    fn add_assign(&mut self, rhs: Self) {
+        // Destructure so adding a field without merging it is a compile
+        // error — the field-by-field merges this replaces silently dropped
+        // `row_meta_files_removed` at two sites when it was added.
+        let Self {
+            bytes_removed,
+            old_versions,
+            data_files_removed,
+            transaction_files_removed,
+            index_files_removed,
+            deletion_files_removed,
+            row_meta_files_removed,
+        } = rhs;
+        self.bytes_removed += bytes_removed;
+        self.old_versions += old_versions;
+        self.data_files_removed += data_files_removed;
+        self.transaction_files_removed += transaction_files_removed;
+        self.index_files_removed += index_files_removed;
+        self.deletion_files_removed += deletion_files_removed;
+        self.row_meta_files_removed += row_meta_files_removed;
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum RemovedFileType {
     Data,
@@ -161,7 +185,7 @@ impl<'a> CleanupTask<'a> {
 
         let referenced_branches: Vec<(String, u64)> = self.find_referenced_branches().await?;
         if self.policy.clean_referenced_branches {
-            self.clean_referenced_branches(&referenced_branches).await?;
+            final_stats += self.clean_referenced_branches(&referenced_branches).await?;
         }
 
         // we process all manifest files in parallel to figure
@@ -201,13 +225,7 @@ impl<'a> CleanupTask<'a> {
         };
 
         let stats = self.delete_unreferenced_files(inspection).await?;
-        final_stats.bytes_removed += stats.bytes_removed;
-        final_stats.old_versions += stats.old_versions;
-        final_stats.data_files_removed += stats.data_files_removed;
-        final_stats.transaction_files_removed += stats.transaction_files_removed;
-        final_stats.index_files_removed += stats.index_files_removed;
-        final_stats.deletion_files_removed += stats.deletion_files_removed;
-        final_stats.row_meta_files_removed += stats.row_meta_files_removed;
+        final_stats += stats;
         Ok(final_stats)
     }
 
@@ -802,14 +820,7 @@ impl<'a> CleanupTask<'a> {
                         .await?
                         {
                             let mut stats_guard = final_stats.lock().unwrap();
-                            stats_guard.bytes_removed += stats.bytes_removed;
-                            stats_guard.old_versions += stats.old_versions;
-                            stats_guard.data_files_removed += stats.data_files_removed;
-                            stats_guard.transaction_files_removed +=
-                                stats.transaction_files_removed;
-                            stats_guard.index_files_removed += stats.index_files_removed;
-                            stats_guard.deletion_files_removed += stats.deletion_files_removed;
-                            stats_guard.row_meta_files_removed += stats.row_meta_files_removed;
+                            *stats_guard += stats;
                         }
                     }
                     Ok::<(), Error>(())

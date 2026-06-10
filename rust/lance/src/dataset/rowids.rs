@@ -1081,6 +1081,55 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_manifest_byte_size_regression_canary() {
+        // No tiny-threshold override here: this pins the DEFAULT manifest
+        // footprint. A production table re-paid 4.9 MB of manifest per
+        // commit before row metas were externalized, and nothing in the
+        // suite would have caught that regression. 100 fragments of
+        // appended rows must stay comfortably small — fragment metadata
+        // ~130 B each, Range-encoded row ids ~16 B, uniform version runs
+        // ~20 B. The 256 KiB bound is ~10x slack over the expected ~25 KiB
+        // so layout changes don't flake it, while a sequence-inlining
+        // regression (MBs) still trips it.
+        const MANIFEST_SIZE_BOUND_BYTES: u64 = 256 * 1024;
+
+        let tmp_dir = lance_core::utils::tempfile::TempStrDir::default();
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_dataset_with_params(
+                &tmp_dir,
+                FragmentCount::from(100),
+                FragmentRowCount::from(1000),
+                Some(WriteParams {
+                    max_rows_per_file: 1000,
+                    enable_stable_row_ids: true,
+                    enable_v2_manifest_paths: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+
+        // One more commit so the measured manifest carries version metadata
+        // assigned through the transaction path, not just initial creation.
+        let batch = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_reader_rows(lance_datagen::RowCount::from(1000), lance_datagen::BatchCount::from(1));
+        dataset.append(batch, None).await.unwrap();
+
+        let manifest_sizes: Vec<u64> = std::fs::read_dir(format!("{}/_versions", &*tmp_dir))
+            .unwrap()
+            .map(|entry| entry.unwrap().metadata().unwrap().len())
+            .collect();
+        let largest = manifest_sizes.iter().copied().max().unwrap();
+        assert!(
+            largest <= MANIFEST_SIZE_BOUND_BYTES,
+            "largest manifest is {largest} bytes (bound {MANIFEST_SIZE_BOUND_BYTES}); a \
+             per-commit metadata growth regression has crept into the manifest",
+        );
+    }
+
+    #[tokio::test]
     async fn test_cleanup_retains_referenced_external_row_metas() {
         force_tiny_row_meta_threshold();
         // Manifest timestamps come from the mocked clock while the tempdir's

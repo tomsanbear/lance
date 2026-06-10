@@ -374,20 +374,31 @@ impl Manifest {
     }
 
     /// Check the current fragment list and update the high water mark
-    pub fn update_max_fragment_id(&mut self) {
+    ///
+    /// # Errors
+    /// When a fragment id exceeds `u32::MAX` — the manifest field is a
+    /// `uint32` and fragment ids are monotonically increasing `u64`s, so a
+    /// long-lived high-churn table can eventually outgrow it. An error at
+    /// the commit boundary beats a panic on the committing thread or, worse,
+    /// the silent `as u32` truncation that would alias bitmap entries.
+    pub fn update_max_fragment_id(&mut self) -> Result<()> {
         // If there are no fragments, don't update max_fragment_id
         if self.fragments.is_empty() {
-            return;
+            return Ok(());
         }
 
-        let max_fragment_id = self
+        let max_id = self
             .fragments
             .iter()
             .map(|f| f.id)
             .max()
-            .unwrap() // Safe because we checked fragments is not empty
-            .try_into()
-            .unwrap();
+            .unwrap(); // Safe because we checked fragments is not empty
+        let max_fragment_id: u32 = max_id.try_into().map_err(|_| {
+            Error::invalid_input(format!(
+                "fragment id {max_id} exceeds the manifest's u32 max_fragment_id field; \
+                 this table has exhausted the 32-bit fragment id space"
+            ))
+        })?;
 
         match self.max_fragment_id {
             None => {
@@ -402,6 +413,7 @@ impl Manifest {
                 }
             }
         }
+        Ok(())
     }
 
     /// Return the max fragment id.

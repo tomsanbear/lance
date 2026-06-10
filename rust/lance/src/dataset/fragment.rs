@@ -2192,13 +2192,24 @@ impl FragmentReader {
         if self.last_updated_at_sequence.is_none() {
             if let Some(sequence) = resolved_sequence {
                 self.last_updated_at_sequence = Some(sequence);
-            } else if let Some(meta) = &self.fragment.last_updated_at_version_meta
-                && let Ok(sequence) = meta.load_sequence()
-            {
-                self.last_updated_at_sequence = Some(Arc::new(sequence));
+            } else if let Some(meta) = &self.fragment.last_updated_at_version_meta {
+                match meta.load_sequence() {
+                    Ok(sequence) => {
+                        self.last_updated_at_sequence = Some(Arc::new(sequence));
+                    }
+                    // Degrade (rows report version 1) rather than fail the
+                    // scan over an audit column, but never silently:
+                    // corrupt persisted metadata must be observable.
+                    Err(error) => tracing::warn!(
+                        fragment_id = self.fragment.id,
+                        %error,
+                        "failed to load last_updated_at version sequence; \
+                         rows default to version 1",
+                    ),
+                }
             }
         }
-        // If no metadata or load fails, sequence remains None (will default to version 1)
+        // If no metadata, sequence remains None (will default to version 1)
 
         // Add the version column to the output schema
         self.output_schema = self
@@ -2220,13 +2231,23 @@ impl FragmentReader {
         if self.created_at_sequence.is_none() {
             if let Some(sequence) = resolved_sequence {
                 self.created_at_sequence = Some(sequence);
-            } else if let Some(meta) = &self.fragment.created_at_version_meta
-                && let Ok(sequence) = meta.load_sequence()
-            {
-                self.created_at_sequence = Some(Arc::new(sequence));
+            } else if let Some(meta) = &self.fragment.created_at_version_meta {
+                match meta.load_sequence() {
+                    Ok(sequence) => {
+                        self.created_at_sequence = Some(Arc::new(sequence));
+                    }
+                    // See `with_row_last_updated_at_version`: degrade
+                    // observably, never silently.
+                    Err(error) => tracing::warn!(
+                        fragment_id = self.fragment.id,
+                        %error,
+                        "failed to load created_at version sequence; \
+                         rows default to version 1",
+                    ),
+                }
             }
         }
-        // If no metadata or load fails, sequence remains None (will default to version 1)
+        // If no metadata, sequence remains None (will default to version 1)
 
         // Add the version column to the output schema
         self.output_schema = self

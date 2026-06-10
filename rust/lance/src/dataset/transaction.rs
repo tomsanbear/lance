@@ -118,9 +118,25 @@ fn resolve_update_version_metadata(
         let mut sorted_frags: Vec<&Fragment> = existing_fragments.iter().collect();
         sorted_frags.sort_by_key(|f| f.id);
         for frag in sorted_frags {
-            if let Some(RowIdMeta::Inline(data)) = &frag.row_id_meta
-                && let Ok(seq) = read_row_ids(data)
-            {
+            // External metas must have been hydrated by the commit path
+            // before this sync code runs; skipping one here would silently
+            // misclassify its rows as inserts and reset their created_at.
+            if let Some(RowIdMeta::External(file)) = &frag.row_id_meta {
+                return Err(Error::internal(format!(
+                    "fragment {} carries an external row-id sequence ('{}') inside sync \
+                     update resolution — the commit path must hydrate row metas first",
+                    frag.id, file.path,
+                )));
+            }
+            if let Some(RowIdMeta::Inline(data)) = &frag.row_id_meta {
+                // Corrupt persisted metadata is an error, not a fragment to
+                // silently skip (skipping resets created_at for its rows).
+                let seq = read_row_ids(data).map_err(|e| {
+                    Error::internal(format!(
+                        "decode row-id sequence of fragment {}: {e}",
+                        frag.id
+                    ))
+                })?;
                 // Range pre-filter: skip the per-row inner loop when the fragment's
                 // bounding row-id range has no overlap with [needed_min, needed_max].
                 // row_id_range() returns None for empty sequences, which are also skipped.
@@ -147,18 +163,23 @@ fn resolve_update_version_metadata(
     // (a protobuf decode) for every single updated row, even when many rows originate
     // from the same fragment.
     let source_frag_ids: HashSet<u64> = row_id_to_source.values().map(|(f, _)| f.id).collect();
-    let version_cache: HashMap<u64, RowDatasetVersionSequence> = existing_fragments
-        .iter()
-        .filter(|f| source_frag_ids.contains(&f.id))
-        .filter_map(|frag| {
-            let seq = frag
-                .created_at_version_meta
-                .as_ref()?
-                .load_sequence()
-                .ok()?;
-            Some((frag.id, seq))
-        })
-        .collect();
+    let mut version_cache: HashMap<u64, RowDatasetVersionSequence> = HashMap::new();
+    for frag in existing_fragments.iter().filter(|f| source_frag_ids.contains(&f.id)) {
+        let Some(meta) = frag.created_at_version_meta.as_ref() else {
+            continue;
+        };
+        // A load failure must not silently fall back to created_at=1 for
+        // every row sourced from this fragment: External means the commit
+        // path skipped hydration; a decode failure means corrupt persisted
+        // metadata. Both are errors.
+        let seq = meta.load_sequence().map_err(|e| {
+            Error::internal(format!(
+                "load created_at version sequence of fragment {}: {e}",
+                frag.id
+            ))
+        })?;
+        version_cache.insert(frag.id, seq);
+    }
 
     for fragment in new_fragments.iter_mut() {
         let row_ids = match &fragment.row_id_meta {
@@ -2372,7 +2393,7 @@ impl Transaction {
         }
         manifest.set_timestamp(timestamp_to_nanos(config.timestamp));
 
-        manifest.update_max_fragment_id();
+        manifest.update_max_fragment_id()?;
 
         match &self.operation {
             Operation::Overwrite {
@@ -2513,6 +2534,22 @@ impl Transaction {
 
         // Handle UpdateBases operation to update manifest base_paths
         if let Operation::UpdateBases { new_bases } = &self.operation {
+            // `base_paths` is append-only by design: a base may legitimately
+            // sit unreferenced between the UpdateBases commit that adds it
+            // and the import that first uses it, so entries cannot be
+            // auto-pruned by reference-counting. Growth is bounded by
+            // explicit operator adds; this cap surfaces a runaway producer
+            // (every entry rides in every subsequent manifest forever).
+            const MAX_BASE_PATHS: usize = 1000;
+            if manifest.base_paths.len() + new_bases.len() > MAX_BASE_PATHS {
+                return Err(Error::invalid_input(format!(
+                    "manifest already carries {} base paths (cap {}); base_paths is \
+                     append-only and rides in every manifest — remove obsolete bases \
+                     before adding more",
+                    manifest.base_paths.len(),
+                    MAX_BASE_PATHS,
+                )));
+            }
             // Validate and add new base paths to the manifest
             for new_base in new_bases {
                 // Check for conflicts with existing base paths
@@ -5783,7 +5820,7 @@ mod tests {
     }
 
     #[test]
-    fn test_update_version_tracking_corrupt_created_at_defaults_to_1() {
+    fn test_update_version_tracking_corrupt_created_at_is_an_error() {
         let existing_seq = RowIdSequence::from([10u64, 11].as_slice());
         let existing_fragment = Fragment {
             id: 1,
@@ -5808,19 +5845,22 @@ mod tests {
             last_updated_at_version_meta: None,
         };
 
+        // Corrupt persisted metadata must fail the commit, not silently
+        // reset the row's lineage to UNKNOWN_CREATED_AT_VERSION — the
+        // silent fallback rewrote audit history without any signal.
         let manifest = make_stable_row_id_manifest(vec![existing_fragment]);
-        let (result, _) = update_txn(vec![new_fragment])
+        let error = update_txn(vec![new_fragment])
             .build_manifest(
                 Some(&manifest),
                 vec![],
                 "txn",
                 &ManifestWriteConfig::default(),
             )
-            .unwrap();
-
-        // Corrupt metadata causes decode to fail → falls back to UNKNOWN_CREATED_AT_VERSION (1)
-        assert_eq!(created_at_versions(&result, 10), vec![1]);
-        assert_eq!(last_updated_at_versions(&result, 10), vec![5]);
+            .expect_err("corrupt created_at metadata must error the update");
+        assert!(
+            error.to_string().contains("created_at version sequence"),
+            "error must name the failing sequence, got: {error}",
+        );
     }
 
     // --- Proposal 1: range pre-filter ---
