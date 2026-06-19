@@ -121,6 +121,7 @@ pub(crate) async fn scan_training_data(
     criteria: &TrainingCriteria,
     fragments: Option<Vec<Fragment>>,
     mem_pool_size: Option<u64>,
+    io_buffer_size: Option<u64>,
 ) -> Result<SendableRecordBatchStream> {
     let num_rows = dataset.count_all_rows().await?;
 
@@ -147,6 +148,13 @@ pub(crate) async fn scan_training_data(
 
     if let Some(fragments) = fragments {
         scan.with_fragments(fragments);
+    }
+
+    // Bound read-ahead for the unindexed-fragment scan. Without this the
+    // scanner uses Lance's 2 GiB default io_buffer; optimizing a heavily
+    // fragmented table on a shared host, that read-ahead dominates RSS.
+    if let Some(io_buffer_size) = io_buffer_size {
+        scan.io_buffer_size(io_buffer_size);
     }
 
     let batches = scan
@@ -189,6 +197,7 @@ pub(crate) async fn load_training_data(
     train: bool,
     fragment_ids: Option<Vec<u32>>,
     mem_pool_size: Option<u64>,
+    io_buffer_size: Option<u64>,
 ) -> Result<SendableRecordBatchStream> {
     // Create training request with fragment_ids if provided
     let training_request = Box::new(match fragment_ids.clone() {
@@ -222,9 +231,25 @@ pub(crate) async fn load_training_data(
                     Ok(frag.metadata().clone())
                 })
                 .collect();
-            scan_training_data(dataset, column, criteria, Some(frags?), mem_pool_size).await
+            scan_training_data(
+                dataset,
+                column,
+                criteria,
+                Some(frags?),
+                mem_pool_size,
+                io_buffer_size,
+            )
+            .await
         } else {
-            scan_training_data(dataset, column, criteria, fragments, mem_pool_size).await
+            scan_training_data(
+                dataset,
+                column,
+                criteria,
+                fragments,
+                mem_pool_size,
+                io_buffer_size,
+            )
+            .await
         }
     } else {
         TrainingRequest::create_empty_stream(dataset, column, criteria).await
@@ -282,6 +307,7 @@ pub(super) async fn build_scalar_index(
     preprocessed_data: Option<SendableRecordBatchStream>,
     progress: Arc<dyn IndexBuildProgress>,
     mem_pool_size: Option<u64>,
+    io_buffer_size: Option<u64>,
 ) -> Result<CreatedIndex> {
     let field = dataset
         .schema()
@@ -309,6 +335,7 @@ pub(super) async fn build_scalar_index(
                 train,
                 fragment_ids.clone(),
                 mem_pool_size,
+                io_buffer_size,
             )
             .await?
         }
@@ -342,6 +369,7 @@ pub(super) async fn build_compound_btree_index(
     train: bool,
     fragment_ids: Option<Vec<u32>>,
     mem_pool_size: Option<u64>,
+    io_buffer_size: Option<u64>,
 ) -> Result<CreatedIndex> {
     let fields: Vec<arrow_schema::Field> = columns
         .iter()
@@ -382,6 +410,7 @@ pub(super) async fn build_compound_btree_index(
         train,
         fragment_ids.clone(),
         mem_pool_size,
+        io_buffer_size,
     )
     .await?;
 
@@ -404,6 +433,7 @@ pub(crate) async fn load_compound_training_data(
     train: bool,
     fragment_ids: Option<Vec<u32>>,
     mem_pool_size: Option<u64>,
+    io_buffer_size: Option<u64>,
 ) -> Result<SendableRecordBatchStream> {
     if !train {
         return create_empty_compound_stream(dataset, columns, criteria).await;
@@ -429,7 +459,8 @@ pub(crate) async fn load_compound_training_data(
         None
     };
 
-    scan_compound_training_data(dataset, columns, criteria, fragments, mem_pool_size).await
+    scan_compound_training_data(dataset, columns, criteria, fragments, mem_pool_size, io_buffer_size)
+        .await
 }
 
 /// Scan training data for compound index.
@@ -439,6 +470,7 @@ async fn scan_compound_training_data(
     criteria: &TrainingCriteria,
     fragments: Option<Vec<Fragment>>,
     mem_pool_size: Option<u64>,
+    io_buffer_size: Option<u64>,
 ) -> Result<SendableRecordBatchStream> {
     let num_rows = dataset.count_all_rows().await?;
 
@@ -463,6 +495,13 @@ async fn scan_compound_training_data(
 
     if let Some(frags) = fragments {
         scan.with_fragments(frags);
+    }
+
+    // Bound read-ahead for the unindexed-fragment scan. Without this the
+    // scanner uses Lance's 2 GiB default io_buffer; optimizing a heavily
+    // fragmented table on a shared host, that read-ahead dominates RSS.
+    if let Some(io_buffer_size) = io_buffer_size {
+        scan.io_buffer_size(io_buffer_size);
     }
 
     let batches = scan
@@ -1243,6 +1282,7 @@ mod tests {
             &TrainingCriteria::new(TrainingOrdering::Addresses).with_row_addr(),
             None,
             true,
+            None,
             None,
             None,
         )

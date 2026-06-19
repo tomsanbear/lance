@@ -133,6 +133,8 @@ pub struct CreateIndexBuilder<'a> {
     transaction_properties: Option<Arc<HashMap<String, String>>>,
     /// Optional sort/aggregate spill pool size in bytes for this index build.
     mem_pool_size: Option<u64>,
+    /// Optional per-scanner io_buffer cap (bytes) for the training-data scan.
+    io_buffer_size: Option<u64>,
 }
 
 impl<'a> CreateIndexBuilder<'a> {
@@ -156,6 +158,7 @@ impl<'a> CreateIndexBuilder<'a> {
             progress: Arc::new(NoopIndexBuildProgress),
             transaction_properties: None,
             mem_pool_size: None,
+            io_buffer_size: None,
         }
     }
 
@@ -216,6 +219,16 @@ impl<'a> CreateIndexBuilder<'a> {
     /// relying on the env var.
     pub fn mem_pool_size(mut self, size: u64) -> Self {
         self.mem_pool_size = Some(size);
+        self
+    }
+
+    /// Set the per-scanner `io_buffer_size` (bytes) for the training-data scan.
+    ///
+    /// Bounds read-ahead while scanning fragments for the index build. Defaults
+    /// to Lance's global (`LANCE_DEFAULT_IO_BUFFER_SIZE`, 2 GiB if unset). Set
+    /// from operator config on memory-constrained hosts.
+    pub fn io_buffer_size(mut self, size: u64) -> Self {
+        self.io_buffer_size = Some(size);
         self
     }
 
@@ -296,6 +309,7 @@ impl<'a> CreateIndexBuilder<'a> {
                         train,
                         self.fragments.clone(),
                         self.mem_pool_size,
+                        self.io_buffer_size,
                     )
                     .await?
                 }
@@ -360,6 +374,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     preprocesssed_data,
                     self.progress.clone(),
                     self.mem_pool_size,
+                    self.io_buffer_size,
                 )
                 .await?
             }
@@ -382,6 +397,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     None,
                     self.progress.clone(),
                     self.mem_pool_size,
+                    self.io_buffer_size,
                 )
                 .await?
             }
@@ -409,6 +425,7 @@ impl<'a> CreateIndexBuilder<'a> {
                     None,
                     self.progress.clone(),
                     self.mem_pool_size,
+                    self.io_buffer_size,
                 )
                 .await?
             }

@@ -529,6 +529,10 @@ pub(crate) async fn remap_index(
                             true, // Legacy reindexing should always train
                             None,
                             None,
+                            // Legacy-format reindex on the remap path: no
+                            // OptimizeOptions in scope, so the scan keeps Lance's
+                            // default io_buffer. Rare and not the maintenance hot path.
+                            None,
                         )
                         .await?;
                         InvertedIndexPlugin::train_inverted_index(

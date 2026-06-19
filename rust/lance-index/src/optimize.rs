@@ -39,6 +39,16 @@ pub struct OptimizeOptions {
     /// NOTE: this option is only supported for v3 vector indices.
     pub retrain: bool,
 
+    /// Per-scanner `io_buffer_size` (bytes) for the training-data scan that
+    /// reads unindexed fragments during optimization. `None` uses Lance's
+    /// default (`LANCE_DEFAULT_IO_BUFFER_SIZE`, 2 GiB if unset). That read-ahead
+    /// is sized for dedicated hosts; on a shared worker optimizing a heavily
+    /// fragmented table it dominates RSS (the unindexed scan reads every
+    /// fragment), so callers on memory-constrained hosts set this from operator
+    /// config. Caps the scan read-ahead only; the sort/aggregate spill pool is
+    /// the separate `mem_pool_size` argument threaded into the training scan.
+    pub io_buffer_size: Option<u64>,
+
     /// Transaction properties to store with this commit.
     ///
     /// These key-value pairs are stored in the transaction file
@@ -56,6 +66,7 @@ impl Default for OptimizeOptions {
             num_indices_to_merge: None,
             index_names: None,
             retrain: false,
+            io_buffer_size: None,
             transaction_properties: None,
             progress: noop_progress(),
         }
@@ -94,6 +105,15 @@ impl OptimizeOptions {
 
     pub fn num_indices_to_merge(mut self, num: Option<usize>) -> Self {
         self.num_indices_to_merge = num;
+        self
+    }
+
+    /// Set the training-scan `io_buffer_size` (bytes) for this optimization.
+    ///
+    /// Bounds read-ahead while scanning unindexed fragments. Leave unset to use
+    /// Lance's default (`LANCE_DEFAULT_IO_BUFFER_SIZE`).
+    pub fn io_buffer_size(mut self, size: u64) -> Self {
+        self.io_buffer_size = Some(size);
         self
     }
 

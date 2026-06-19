@@ -287,6 +287,11 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         lance_datafusion::logical_expr::field_path_to_expr(&field_path)?;
                     scanner.filter_expr(column_expr.is_not_null());
                 }
+                // Same read-ahead cap as the scalar/inverted training scans: the
+                // vector unindexed scan otherwise rides Lance's 2 GiB default.
+                if let Some(io_buffer_size) = options.io_buffer_size {
+                    scanner.io_buffer_size(io_buffer_size);
+                }
                 Some(scanner.try_into_stream().await?)
             };
 
@@ -404,6 +409,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         true,
                         None,
                         None,
+                        options.io_buffer_size,
                     )
                     .await?;
                     let new_uuid = Uuid::new_v4();
@@ -417,6 +423,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         Some(new_data_stream),
                         Arc::new(NoopIndexBuildProgress),
                         None,
+                        options.io_buffer_size,
                     )
                     .await?;
                     return Ok(Some(IndexMergeResults {
@@ -438,6 +445,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     true,
                     None,
                     None,
+                    options.io_buffer_size,
                 )
                 .await?;
 
@@ -498,6 +506,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         Some(new_data_stream),
                         Arc::new(NoopIndexBuildProgress),
                         None,
+                        options.io_buffer_size,
                     )
                     .await?
                 } else {
@@ -568,6 +577,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     true,
                     None,
                     None,
+                    options.io_buffer_size,
                 )
                 .await?;
 
@@ -587,6 +597,7 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                         Some(new_data_stream),
                         Arc::new(NoopIndexBuildProgress),
                         None,
+                        options.io_buffer_size,
                     )
                     .await?
                 } else {
